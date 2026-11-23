@@ -1,434 +1,857 @@
+"""
+LootZone Affiliate Bot — versão consolidada
+Python 3.11+
+Dependências: python-telegram-bot[job-queue]==22.5, requests==2.32.5
+
+Variáveis Railway:
+TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, SHOPEE_APP_ID, SHOPEE_SECRET
+Opcional:
+SEEN_FILE=/data/seen_items.json
+GARIMPO_MAX_PAGES=2
+GARIMPO_REQUEST_DELAY=0.4
+REPORT_HOUR=10
+
+Observação:
+- Concorrência de afiliados não é fornecida pela productOfferV2. O bot não inventa esse dado.
+- Confirme o schema/campos da sua conta no Open API Explorer antes do deploy.
+"""
+
 import os
-import html
-import time
+import re
 import json
+import time
+import html
 import math
 import hashlib
 import asyncio
 import logging
-import requests
-
+import tempfile
 from pathlib import Path
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
+from typing import Any
 
+import requests
 from telegram import Update
+from telegram.constants import ParseMode
+from telegram.error import TelegramError, RetryAfter
 from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
 )
 
-# =====================================================
-# 1. CONFIGURAÇÕES
-# =====================================================
+# ---------------------------------------------------------------------
+# Configuração
+# ---------------------------------------------------------------------
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID_RAW = os.getenv("TELEGRAM_CHAT_ID")
-
-SHOPEE_APP_ID = os.getenv("SHOPEE_APP_ID")
-SHOPEE_SECRET = os.getenv("SHOPEE_SECRET")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+CHAT_ID_RAW = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+SHOPEE_APP_ID = os.getenv("SHOPEE_APP_ID", "").strip()
+SHOPEE_SECRET = os.getenv("SHOPEE_SECRET", "").strip()
 
 SHOPEE_URL = "https://open-api.affiliate.shopee.com.br/graphql"
 BR_TZ = ZoneInfo("America/Sao_Paulo")
 
-SEEN_FILE = Path("seen_items.json")
+SEEN_FILE = Path(os.getenv("SEEN_FILE", "/data/seen_items.json"))
 SEEN_TTL_DAYS = 7
-
-# =====================================================
-# 2. CONFIGURAÇÕES DO GARIMPO V3 (LOOTZONE)
-# =====================================================
+MAX_PRODUCT_PAGES = max(1, min(int(os.getenv("GARIMPO_MAX_PAGES", "2")), 5))
+REQUEST_DELAY = max(0.2, float(os.getenv("GARIMPO_REQUEST_DELAY", "0.4")))
+REPORT_HOUR = max(0, min(int(os.getenv("REPORT_HOUR", "10")), 23))
 
 GARIMPO_CONFIG = {
-    "min_commission_rate": Decimal("0.08"),     # 8% mínimo
-    "min_commission_value": Decimal("12.00"),   # R$ 12,00 mínimo por venda
-    "min_sales": 50,                            # Demanda ativa sem saturar só no Top 10
-    "min_price": Decimal("60.00"),              # Faixa de ticket rentável
-    "max_price": Decimal("220.00"),             # Teto para compra por impulso/kits
-    "min_rating": Decimal("4.6"),               # Qualidade mínima quando informada
-
     "limit": 30,
     "max_results": 15,
-    "request_delay": 0.25,
+    "min_rating": Decimal("4.6"),
+    "min_sales": 50,
+    "min_commission_rate": Decimal("0.08"),
+    "request_delay": REQUEST_DELAY,
+    "max_pages": MAX_PRODUCT_PAGES,
     "fallback_category_limit": 5,
+    "history_days": SEEN_TTL_DAYS,
 }
 
-# Categorias, palavras-chave e vagas iniciais (alinhadas ao perfil LOOTZONE).
+# Quotas somam 15. Diversificação escolhida para a LootZone.
 GARIMPO_CATEGORIES = {
     "Casa e decoração": {
         "quota": 4,
-        "keywords": [
-            "quadros decorativos",
-            "bandeja decorativa",
-            "espelho decorativo",
-        ],
+        "keywords": ["quadros decorativos", "bandeja decorativa", "espelho decorativo"],
+        "price_min": Decimal("25"), "price_max": Decimal("250"),
     },
     "Móveis e organização": {
-        "quota": 4,
-        "keywords": [
-            "caixa organizadora",
-            "mesa redonda",
-            "organizador de casa",
-        ],
+        "quota": 3,
+        "keywords": ["caixa organizadora", "mesa redonda", "organizador de casa"],
+        "price_min": Decimal("50"), "price_max": Decimal("500"),
     },
     "Cozinha e utilidades": {
-        "quota": 3,
-        "keywords": [
-            "pote hermetico",
-            "lixeira automatica",
-        ],
+        "quota": 2,
+        "keywords": ["pote hermetico", "lixeira automatica", "fruteira cozinha"],
+        "price_min": Decimal("20"), "price_max": Decimal("250"),
     },
     "Iluminação": {
-        "quota": 2,
-        "keywords": [
-            "luminaria",
-            "abajur",
-        ],
+        "quota": 1,
+        "keywords": ["luminaria", "abajur"],
+        "price_min": Decimal("25"), "price_max": Decimal("250"),
     },
     "Geek e colecionáveis": {
-        "quota": 1,
-        "keywords": [
-            "pelucia pokemon",
-            "funko pop",
-        ],
+        "quota": 2,
+        "keywords": ["pelucia pokemon", "funko pop", "colecionavel geek"],
+        "price_min": Decimal("25"), "price_max": Decimal("350"),
     },
     "Tecnologia e gadgets": {
         "quota": 1,
-        "keywords": [
-            "suporte celular",
-            "fone bluetooth",
-        ],
+        "keywords": ["suporte celular", "fone bluetooth", "acessorios tecnologia"],
+        "price_min": Decimal("25"), "price_max": Decimal("350"),
+    },
+    "Moda e vestuário": {
+        "quota": 2,
+        "keywords": ["camiseta streetwear", "moletom oversized", "roupa y2k"],
+        "price_min": Decimal("30"), "price_max": Decimal("250"),
     },
 }
+SORT_TYPES = (2, 5)  # 2 vendas; 5 comissão
 
-# Ordenações da Shopee:
-# 2 = Mais vendidos | 5 = Maior comissão
-GARIMPO_SORT_TYPES = [2, 5]
+# pesos iniciais estratégicos; serão calibrados com resultados reais
+SCORE_WEIGHTS = {
+    "demand": 30,
+    "profit": 30,
+    "competition": 20,  # atualmente neutro/desconhecido: API não fornece o número
+    "quality": 10,
+    "content": 10,      # heurística por categoria/termo, não dado da API
+}
 
-
-# =====================================================
-# 3. LOGS
-# =====================================================
+# ---------------------------------------------------------------------
+# Logs e estado
+# ---------------------------------------------------------------------
 
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
     level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-logger = logging.getLogger("LootZoneAnalytics")
+logger = logging.getLogger("lootzone_bot")
+SEEN_LOCK = asyncio.Lock()
+GARIMPO_LOCK = asyncio.Lock()
+HTTP = requests.Session()
 
 
-# =====================================================
-# 4. VALIDAÇÃO DAS CONFIGURAÇÕES
-# =====================================================
-
-def validate_config():
-    required = {
-        "TELEGRAM_TOKEN": TELEGRAM_TOKEN,
-        "TELEGRAM_CHAT_ID": CHAT_ID_RAW,
-        "SHOPEE_APP_ID": SHOPEE_APP_ID,
-        "SHOPEE_SECRET": SHOPEE_SECRET,
-    }
-    missing = [key for key, value in required.items() if not value]
+def validate_environment() -> int:
+    missing = [
+        name for name, value in {
+            "TELEGRAM_TOKEN": TELEGRAM_TOKEN,
+            "TELEGRAM_CHAT_ID": CHAT_ID_RAW,
+            "SHOPEE_APP_ID": SHOPEE_APP_ID,
+            "SHOPEE_SECRET": SHOPEE_SECRET,
+        }.items() if not value
+    ]
     if missing:
-        raise RuntimeError(
-            "Variáveis ausentes no Railway: " + ", ".join(missing)
-        )
+        raise RuntimeError("Variáveis de ambiente ausentes: " + ", ".join(missing))
     try:
         return int(CHAT_ID_RAW)
-    except ValueError:
-        raise RuntimeError("TELEGRAM_CHAT_ID inválido.")
+    except ValueError as exc:
+        raise RuntimeError("TELEGRAM_CHAT_ID precisa ser numérico.") from exc
 
 
-CHAT_ID = validate_config()
+CHAT_ID = validate_environment()
 
 
-# =====================================================
-# 5. FUNÇÕES AUXILIARES & HISTÓRICO ANTI-REPETIÇÃO
-# =====================================================
-
-def to_decimal(value):
+def dec(value: Any) -> Decimal:
     try:
-        return Decimal(str(value or "0"))
+        return Decimal(str(value if value not in (None, "") else "0"))
     except (InvalidOperation, ValueError, TypeError):
         return Decimal("0")
 
 
-def format_money(value):
+def money(value: Any) -> str:
+    number = float(dec(value))
+    return f"R$ {number:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def safe_int(value: Any, default: int = 0) -> int:
     try:
-        number = float(value)
-        return (
-            f"R$ {number:,.2f}"
-            .replace(",", "X")
-            .replace(".", ",")
-            .replace("X", ".")
-        )
+        return int(float(value))
     except (ValueError, TypeError):
-        return "R$ 0,00"
+        return default
 
 
-def get_period_start_end(start_dt, end_dt):
-    return int(start_dt.timestamp()), int(end_dt.timestamp())
+def now_br() -> datetime:
+    return datetime.now(BR_TZ)
 
 
-def load_seen_items():
-    if not SEEN_FILE.exists():
-        return {}
-    try:
-        data = json.loads(SEEN_FILE.read_text(encoding="utf-8"))
-        cutoff = time.time() - (SEEN_TTL_DAYS * 86400)
-        return {k: v for k, v in data.items() if v >= cutoff}
-    except Exception:
-        return {}
+def is_authorized(update: Update) -> bool:
+    return bool(update.effective_chat and update.effective_chat.id == CHAT_ID)
 
 
-def save_seen_items(seen_dict):
-    try:
-        SEEN_FILE.write_text(
-            json.dumps(seen_dict, ensure_ascii=False),
-            encoding="utf-8",
-        )
-    except Exception:
-        logger.exception("Não foi possível salvar seen_items.json.")
-
-
-def clear_seen_items():
-    try:
-        if SEEN_FILE.exists():
-            SEEN_FILE.unlink()
-    except Exception:
-        logger.exception("Não foi possível limpar seen_items.json.")
-
-
-# =====================================================
-# 6. SEGURANÇA DO TELEGRAM
-# =====================================================
-
-def autorizado(update: Update):
-    return (
-        update.effective_chat is not None
-        and update.effective_chat.id == CHAT_ID
-    )
-
-
-async def verificar_acesso(update: Update):
-    if not autorizado(update):
+async def guard(update: Update) -> bool:
+    if not is_authorized(update):
         if update.effective_message:
             await update.effective_message.reply_text("Acesso não autorizado.")
         return False
     return True
 
 
-# =====================================================
-# 7. CONEXÃO SHOPEE API
-# =====================================================
+# ---------------------------------------------------------------------
+# Persistência anti-repetição
+# ---------------------------------------------------------------------
 
-def shopee_request(query: str):
-    timestamp = str(int(time.time()))
+def _load_seen_sync() -> dict[str, float]:
+    if not SEEN_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(SEEN_FILE.read_text(encoding="utf-8"))
+        cutoff = time.time() - SEEN_TTL_DAYS * 86400
+        clean = {}
+        if isinstance(raw, dict):
+            for key, value in raw.items():
+                try:
+                    stamp = float(value)
+                    if stamp >= cutoff:
+                        clean[str(key)] = stamp
+                except (ValueError, TypeError):
+                    continue
+        return clean
+    except Exception:
+        logger.exception("Falha ao ler histórico; não será apagado automaticamente.")
+        return {}
+
+
+def _save_seen_sync(data: dict[str, float]) -> None:
+    SEEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix="seen_items_", suffix=".tmp", dir=str(SEEN_FILE.parent)
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, SEEN_FILE)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+
+
+async def load_seen() -> dict[str, float]:
+    async with SEEN_LOCK:
+        return await asyncio.to_thread(_load_seen_sync)
+
+
+async def mark_seen(item_ids: list[str]) -> None:
+    async with SEEN_LOCK:
+        data = await asyncio.to_thread(_load_seen_sync)
+        stamp = time.time()
+        for item_id in item_ids:
+            data[str(item_id)] = stamp
+        await asyncio.to_thread(_save_seen_sync, data)
+
+
+async def clear_seen() -> None:
+    async with SEEN_LOCK:
+        await asyncio.to_thread(
+            lambda: SEEN_FILE.unlink(missing_ok=True)
+        )# ---------------------------------------------------------------------
+# Shopee GraphQL
+# ---------------------------------------------------------------------
+
+def shopee_request(query: str, max_attempts: int = 4) -> dict:
     payload = json.dumps(
         {"query": query},
         separators=(",", ":"),
         ensure_ascii=False,
     )
+    timestamp = str(int(time.time()))
     signature = hashlib.sha256(
         (SHOPEE_APP_ID + timestamp + payload + SHOPEE_SECRET).encode("utf-8")
     ).hexdigest()
-
     headers = {
         "Authorization": (
-            f"SHA256 Credential={SHOPEE_APP_ID}, "
-            f"Timestamp={timestamp}, "
+            f"SHA256 Credential={SHOPEE_APP_ID}, Timestamp={timestamp}, "
             f"Signature={signature}"
         ),
         "Content-Type": "application/json",
     }
 
-    response = requests.post(
-        SHOPEE_URL,
-        data=payload.encode("utf-8"),
-        headers=headers,
-        timeout=30,
+    last_error = None
+    for attempt in range(max_attempts):
+        try:
+            response = HTTP.post(
+                SHOPEE_URL,
+                data=payload.encode("utf-8"),
+                headers=headers,
+                timeout=(10, 35),
+            )
+            if response.status_code == 429 or response.status_code >= 500:
+                wait = min(2 ** attempt, 12)
+                logger.warning("Shopee HTTP %s; nova tentativa em %ss.",
+                               response.status_code, wait)
+                time.sleep(wait)
+                continue
+            response.raise_for_status()
+            body = response.json()
+            errors = body.get("errors") or []
+            if errors:
+                # GraphQL pode retornar data parcial junto com errors; não fingir sucesso.
+                if not body.get("data"):
+                    raise RuntimeError("GraphQL: " + json.dumps(errors, ensure_ascii=False)[:1200])
+                logger.warning("GraphQL retornou dados parciais com erros: %s",
+                               json.dumps(errors, ensure_ascii=False)[:600])
+            return body
+        except (requests.RequestException, ValueError, RuntimeError) as exc:
+            last_error = exc
+            if attempt < max_attempts - 1:
+                time.sleep(min(2 ** attempt, 12))
+    raise RuntimeError(f"Falha na comunicação com a Shopee: {last_error}")
+
+
+def fetch_products(keyword: str, sort_type: int) -> list[dict]:
+    safe_keyword = json.dumps(keyword, ensure_ascii=False)
+    products: list[dict] = []
+    page = 1
+
+    for page_index in range(GARIMPO_CONFIG["max_pages"]):
+        query = f"""
+        {{
+          productOfferV2(
+            keyword: {safe_keyword},
+            listType: 0,
+            sortType: {sort_type},
+            page: {page},
+            limit: {GARIMPO_CONFIG["limit"]}
+          ) {{
+            nodes {{
+              itemId
+              productName
+              commission
+              commissionRate
+              sellerCommissionRate
+              shopeeCommissionRate
+              priceMin
+              priceMax
+              sales
+              ratingStar
+              shopName
+              shopId
+              offerLink
+              imageUrl
+              periodEndTime
+              shopType
+            }}
+            pageInfo {{
+              page
+              limit
+              hasNextPage
+            }}
+          }}
+        }}
+        """
+        body = shopee_request(query)
+        result = body.get("data", {}).get("productOfferV2") or {}
+        products.extend(result.get("nodes") or [])
+        page_info = result.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            break
+        page += 1
+        time.sleep(REQUEST_DELAY)
+
+    return products
+
+
+# ---------------------------------------------------------------------
+# Critérios e ranking
+# ---------------------------------------------------------------------
+
+def estimated_commission(product: dict) -> Decimal:
+    # commission é preferido quando presente. Fallback é estimativa priceMin * taxa.
+    api_value = dec(product.get("commission"))
+    if api_value > 0:
+        return api_value
+    return dec(product.get("priceMin")) * dec(product.get("commissionRate"))
+
+
+def content_score(category: str, keyword: str) -> float:
+    # Heurística editorial inicial; não representa previsão estatística de conversão.
+    visual_terms = (
+        "quadro", "espelho", "luminaria", "abajur", "pelucia", "funko",
+        "fruteira", "mesa", "bandeja", "pote", "organizador", "streetwear",
+        "moletom", "camiseta",
     )
-    response.raise_for_status()
-    data = response.json()
-
-    if data.get("errors"):
-        raise RuntimeError(f"Erro GraphQL: {data['errors']}")
-
-    return data
+    text = f"{category} {keyword}".lower()
+    return 9.0 if any(term in text for term in visual_terms) else 6.5
 
 
-# =====================================================
-# 8. RELATÓRIOS DE CONVERSÃO (COM PAGINAÇÃO AUTOMÁTICA)
-# =====================================================
+def eligible(product: dict, category: str) -> tuple[bool, str]:
+    price = dec(product.get("priceMin"))
+    sales = safe_int(product.get("sales"))
+    rating = dec(product.get("ratingStar"))
+    rate = dec(product.get("commissionRate"))
+    cfg = GARIMPO_CATEGORIES[category]
 
-def get_conversions(
-    start_ts: int,
-    end_ts: int,
-    limit: int = 100,
-    max_pages: int = 10,
-):
-    all_nodes = []
+    if price <= 0:
+        return False, "preço indisponível"
+    if not (cfg["price_min"] <= price <= cfg["price_max"]):
+        return False, "fora da faixa de preço da categoria"
+    if sales < GARIMPO_CONFIG["min_sales"]:
+        return False, "demanda abaixo do mínimo exploratório"
+    if rating > 0 and rating < GARIMPO_CONFIG["min_rating"]:
+        return False, "avaliação abaixo de 4,6"
+    # Taxa é um filtro suave: produtos abaixo de 8% continuam elegíveis
+    # se a comissão em reais for forte; evita eliminar oportunidades de giro.
+    commission = estimated_commission(product)
+    if rate < GARIMPO_CONFIG["min_commission_rate"] and commission < Decimal("5"):
+        return False, "comissão e taxa baixas"
+    return True, ""
+
+
+def normalize_log(value: float, maximum: float) -> float:
+    if maximum <= 0:
+        return 0.0
+    return min(1.0, math.log1p(max(0.0, value)) / math.log1p(maximum))
+
+
+def score_products(products: list[dict]) -> list[dict]:
+    max_sales = max([safe_int(p.get("sales")) for p in products] or [1])
+    max_comm = max([float(estimated_commission(p)) for p in products] or [1])
+    scored = []
+
+    for product in products:
+        category = product["_category"]
+        keyword = product["_keyword"]
+        sales = safe_int(product.get("sales"))
+        commission = float(estimated_commission(product))
+        rating = dec(product.get("ratingStar"))
+        demand_points = normalize_log(sales, max_sales) * 30
+        profit_points = normalize_log(commission, max_comm) * 30
+        quality_points = (float(min(rating, Decimal("5"))) / 5 * 10) if rating > 0 else 5.0
+        content_points = content_score(category, keyword)
+
+        # API não informa contagem de afiliados promovendo. Neutralidade explícita.
+        competition_points = 10.0
+        total = min(100.0, demand_points + profit_points + quality_points
+                    + content_points + competition_points)
+
+        pmin = dec(product.get("priceMin"))
+        pmax = dec(product.get("priceMax"))
+        if pmax <= 0:
+            variation_label = "Variações: dado indisponível"
+        elif pmax <= pmin:
+            variation_label = "Faixa de preço sem variação informada"
+        elif pmax / max(pmin, Decimal("0.01")) <= Decimal("1.05"):
+            variation_label = "Faixa de preço estreita"
+        elif pmax / max(pmin, Decimal("0.01")) <= Decimal("1.40"):
+            variation_label = "Faixa de preço moderada"
+        else:
+            variation_label = "Grande diferença entre preços; conferir variações"
+
+        product["_score"] = round(total, 1)
+        product["_commission_est"] = commission
+        product["_price_min"] = pmin
+        product["_price_max"] = pmax
+        product["_sales"] = sales
+        product["_rating"] = rating
+        product["_variation_label"] = variation_label
+        product["_competition"] = "Desconhecida (não fornecida pela API)"
+        product["_score_parts"] = {
+            "demanda": round(demand_points, 1),
+            "rentabilidade": round(profit_points, 1),
+            "qualidade": round(quality_points, 1),
+            "conteudo": round(content_points, 1),
+            "concorrencia": round(competition_points, 1),
+        }
+        scored.append(product)
+
+    return sorted(scored, key=lambda p: p["_score"], reverse=True)
+
+
+def collect_candidates(seen: dict[str, float]) -> tuple[list[dict], list[str]]:
+    raw: dict[str, dict] = {}
+    errors: list[str] = []
+
+    for category, config in GARIMPO_CATEGORIES.items():
+        for keyword in config["keywords"]:
+            for sort_type in SORT_TYPES:
+                try:
+                    results = fetch_products(keyword, sort_type)
+                    for product in results:
+                        item_id = str(product.get("itemId") or "")
+                        if not item_id or item_id in seen:
+                            continue
+                        ok, _reason = eligible(product, category)
+                        if not ok:
+                            continue
+                        # Mesmo item encontrado em mais de uma busca: guardar a melhor origem.
+                        old = raw.get(item_id)
+                        candidate = dict(product)
+                        candidate["_category"] = category
+                        candidate["_keyword"] = keyword
+                        if old is None or estimated_commission(candidate) > estimated_commission(old):
+                            raw[item_id] = candidate
+                except Exception as exc:
+                    logger.exception("Falha no garimpo: %s / %s", category, keyword)
+                    errors.append(f"{category} — {keyword}: {str(exc)[:160]}")
+                time.sleep(REQUEST_DELAY)
+
+    return list(raw.values()), errors
+
+
+def select_by_category(scored: list[dict]) -> list[dict]:
+    selected: list[dict] = []
+    selected_ids: set[str] = set()
+    category_counts = {name: 0 for name in GARIMPO_CATEGORIES}
+
+    # Primeira passada: quotas.
+    for category, config in GARIMPO_CATEGORIES.items():
+        candidates = [p for p in scored if p["_category"] == category]
+        for product in candidates:
+            item_id = str(product.get("itemId"))
+            if category_counts[category] >= config["quota"]:
+                break
+            if item_id not in selected_ids:
+                selected.append(product)
+                selected_ids.add(item_id)
+                category_counts[category] += 1
+
+    # Segunda passada: redistribuir vagas sem permitir concentração excessiva.
+    for product in scored:
+        if len(selected) >= GARIMPO_CONFIG["max_results"]:
+            break
+        item_id = str(product.get("itemId"))
+        category = product["_category"]
+        if item_id in selected_ids:
+            continue
+        if category_counts[category] >= GARIMPO_CONFIG["fallback_category_limit"]:
+            continue
+        selected.append(product)
+        selected_ids.add(item_id)
+        category_counts[category] += 1
+# ---------------------------------------------------------------------
+# Telegram: apresentação
+# ---------------------------------------------------------------------
+
+def product_caption(product: dict, index: int) -> str:
+    name = html.escape(str(product.get("productName") or "Produto sem nome")[:180])
+    shop = html.escape(str(product.get("shopName") or "Loja não informada")[:80])
+    category = html.escape(product["_category"])
+    link = str(product.get("offerLink") or "").strip()
+    commission_rate = dec(product.get("commissionRate")) * 100
+    rating = product["_rating"]
+    rating_text = f"{rating:.1f}/5" if rating > 0 else "Não informada"
+    url_line = f'<a href="{html.escape(link, quote=True)}">Ver oferta na Shopee</a>' if link.startswith("http") else "Link de oferta indisponível"
+
+    return (
+        f"<b>#{index} · {name}</b>\n"
+        f"Categoria: {category}\n"
+        f"Preço: <b>{money(product['_price_min'])}</b>\n"
+        f"Comissão estimada: <b>{money(product['_commission_est'])}</b> "
+        f"({commission_rate:.1f}%)\n"
+        f"Vendas informadas: {product['_sales']:,}\n"
+        f"Avaliação: {rating_text}\n"
+        f"Loja: {shop}\n"
+        f"Pontuação: <b>{product['_score']}/100</b>\n"
+        f"Concorrência: {product['_competition']}\n"
+        f"{html.escape(product['_variation_label'])}\n"
+        f"{url_line}"
+    )
+
+
+async def send_product(bot, product: dict, index: int) -> bool:
+    caption = product_caption(product, index)
+    image_url = str(product.get("imageUrl") or "").strip()
+    try:
+        if image_url.startswith("https://") or image_url.startswith("http://"):
+            await bot.send_photo(
+                chat_id=CHAT_ID,
+                photo=image_url,
+                caption=caption[:1024],
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await bot.send_message(
+                chat_id=CHAT_ID,
+                text=caption,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        return True
+    except RetryAfter as exc:
+        await asyncio.sleep(float(exc.retry_after) + 1)
+        try:
+            await bot.send_message(
+                chat_id=CHAT_ID, text=caption,
+                parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+            )
+            return True
+        except TelegramError:
+            logger.exception("Falha ao reenviar produto %s.", product.get("itemId"))
+            return False
+    except TelegramError:
+        logger.exception("Falha ao enviar produto %s.", product.get("itemId"))
+        return False
+
+
+async def garimpo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update):
+        return
+    if GARIMPO_LOCK.locked():
+        await update.effective_message.reply_text("Um garimpo já está em andamento. Aguarde terminar.")
+        return
+
+    async with GARIMPO_LOCK:
+        status_msg = await update.effective_message.reply_text(
+            "🔎 Iniciando garimpo da LootZone. Isso pode levar alguns minutos..."
+        )
+        seen = await load_seen()
+        candidates, errors = await asyncio.to_thread(collect_candidates, seen)
+        if not candidates:
+            await status_msg.edit_text(
+                "Não encontrei produtos elegíveis nesta execução. "
+                "Tente novamente mais tarde ou revise os filtros."
+            )
+            if errors:
+                logger.warning("Erros de consulta: %s", errors[:8])
+            return
+
+        scored = score_products(candidates)
+        selected = select_by_category(scored)
+        sent_ids = []
+        sent_count = 0
+        for index, product in enumerate(selected, 1):
+            success = await send_product(context.bot, product, index)
+            if success:
+                sent_count += 1
+                sent_ids.append(str(product["itemId"]))
+            await asyncio.sleep(0.45)
+
+        # Marcar somente os que foram efetivamente enviados.
+        if sent_ids:
+            await mark_seen(sent_ids)
+
+        summary = (
+            f"✅ Garimpo concluído.\n"
+            f"Produtos encontrados: {len(candidates)}\n"
+            f"Selecionados: {len(selected)}\n"
+            f"Enviados: {sent_count}\n"
+            f"Histórico: {SEEN_TTL_DAYS} dias\n"
+            f"Concorrência de afiliados: indisponível na API; não estimada."
+        )
+        if errors:
+            summary += f"\nConsultas com erro: {len(errors)} (detalhes no log)."
+        await status_msg.edit_text(summary)
+
+
+# ---------------------------------------------------------------------
+# Conversion report
+# ---------------------------------------------------------------------
+
+def get_conversions(start_ts: int, end_ts: int, limit: int = 100, max_pages: int = 10):
+    nodes: list[dict] = []
     scroll_id = None
 
-    try:
-        for _ in range(max_pages):
-            scroll_param = (
-                f', scrollId: {json.dumps(scroll_id)}'
-                if scroll_id
-                else ""
-            )
-
-            query = f"""
-            query {{
-              conversionReport(
-                purchaseTimeStart: {start_ts},
-                purchaseTimeEnd: {end_ts},
-                limit: {limit}{scroll_param}
-              ) {{
-                nodes {{
-                  purchaseTime
-                  clickTime
-                  utmContent
-                  buyerType
-                  totalCommission
-                  netCommission
-                  sellerCommission
-
-                  orders {{
-                    orderId
-                    items {{
-                      itemId
-                      itemName
-                      qty
-                      actualAmount
-                      itemTotalCommission
-                    }}
-                  }}
-                }}
-
-                pageInfo {{
-                  hasNextPage
-                  scrollId
+    for page_num in range(max_pages):
+        scroll_arg = f", scrollId: {json.dumps(scroll_id)}" if scroll_id else ""
+        query = f"""
+        {{
+          conversionReport(
+            purchaseTimeStart: {start_ts},
+            purchaseTimeEnd: {end_ts},
+            limit: {limit}{scroll_arg}
+          ) {{
+            nodes {{
+              conversionId
+              purchaseTime
+              clickTime
+              totalCommission
+              netCommission
+              sellerCommission
+              orders {{
+                orderId
+                orderStatus
+                items {{
+                  itemId
+                  itemName
+                  qty
+                  actualAmount
+                  itemTotalCommission
                 }}
               }}
             }}
-            """
-
-            data = shopee_request(query)
-            report = data.get("data", {}).get("conversionReport", {})
-            nodes = report.get("nodes", [])
-            all_nodes.extend(nodes)
-
-            page_info = report.get("pageInfo", {})
-            has_next = page_info.get("hasNextPage")
-            scroll_id = page_info.get("scrollId")
-
-            if not has_next or not scroll_id:
-                break
-
-            time.sleep(0.25)
-
-        return all_nodes, None
-
-    except Exception as e:
-        logger.exception("Erro ao consultar conversões.")
-        return None, str(e)
+            pageInfo {{ hasNextPage scrollId }}
+          }}
+        }}
+        """
+        body = shopee_request(query)
+        report = body.get("data", {}).get("conversionReport") or {}
+        nodes.extend(report.get("nodes") or [])
+        page_info = report.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            return nodes, False
+        scroll_id = page_info.get("scrollId")
+        if not scroll_id:
+            raise RuntimeError("Shopee indicou próxima página, mas não retornou scrollId.")
+        # scrollId tem validade curta; continuar imediatamente.
+    raise RuntimeError(
+        f"Relatório excedeu o limite de {max_pages} páginas. "
+        "Resultado parcial não será apresentado como completo."
+    )
 
 
-# =====================================================
-# 9. RESUMO DE VENDAS
-# =====================================================
-
-def summarize(nodes):
-    total_orders = 0
-    total_commission = 0.0
-    products = {}
+def summarize_conversions(nodes: list[dict]) -> dict:
+    total_commission = Decimal("0")
+    orders: dict[str, dict] = {}
+    products: dict[str, dict] = {}
+    statuses = {"UNPAID": 0, "PENDING": 0, "COMPLETED": 0, "CANCELLED": 0, "UNKNOWN": 0}
+    seen_conversion_ids = set()
 
     for node in nodes:
-        total_commission += float(node.get("netCommission") or 0)
+        conversion_id = str(node.get("conversionId") or "")
+        # Evitar somar o mesmo nó de conversão repetido em páginas.
+        if conversion_id and conversion_id in seen_conversion_ids:
+            continue
+        if conversion_id:
+            seen_conversion_ids.add(conversion_id)
+        total_commission += dec(node.get("netCommission"))
 
-        for order in node.get("orders", []):
-            total_orders += 1
-            for item in order.get("items", []):
-                name = (item.get("itemName") or "Produto")[:50]
-                commission = float(item.get("itemTotalCommission") or 0)
-                qty = int(item.get("qty") or 1)
+        for order in node.get("orders") or []:
+            order_id = str(order.get("orderId") or "")
+            status = str(order.get("orderStatus") or "UNKNOWN").upper()
+            if status not in statuses:
+                status = "UNKNOWN"
+            if order_id and order_id not in orders:
+                orders[order_id] = {"status": status}
+                statuses[status] += 1
 
-                if name not in products:
-                    products[name] = {"qty": 0, "commission": 0.0}
+            for item in order.get("items") or []:
+                item_id = str(item.get("itemId") or item.get("itemName") or "Produto")
+                name = str(item.get("itemName") or "Produto")
+                record = products.setdefault(item_id, {"name": name, "qty": 0, "commission": Decimal("0")})
+                record["qty"] += safe_int(item.get("qty"), 1)
+                record["commission"] += dec(item.get("itemTotalCommission"))
 
-                products[name]["qty"] += qty
-                products[name]["commission"] += commission
-
-    top_products = sorted(
-        products.items(),
-        key=lambda x: x[1]["commission"],
-        reverse=True,
-    )[:5]
-
-    return total_orders, total_commission, top_products
+    top = sorted(products.values(), key=lambda x: x["commission"], reverse=True)[:5]
+    return {
+        "orders": len(orders),
+        "commission": total_commission,
+        "statuses": statuses,
+        "top": top,
+    }
 
 
-# =====================================================
-# 10. FORMATAÇÃO DOS RELATÓRIOS (HTML SEGURO)
-# =====================================================
-
-def make_report(title, nodes, start_date, end_date):
-    if nodes is None:
-        return (
-            "⚠️ Erro ao buscar dados da Shopee.\n"
-            "Tente novamente em alguns minutos."
-        )
-
-    orders, commission, top = summarize(nodes)
-    safe_title = html.escape(title)
-
-    text = f"📊 <b>{safe_title}</b>\n"
-    text += f"📅 Período: <code>{start_date}</code> → <code>{end_date}</code>\n\n"
-    text += f"🛒 Pedidos: <b>{orders}</b>\n"
-    text += f"💰 Comissão registrada: <b>{format_money(commission)}</b>\n\n"
-
-    if top:
-        text += "🔥 <b>Top produtos do período:</b>\n"
-        for i, (name, data) in enumerate(top, 1):
-            safe_name = html.escape(name)
-            text += f"{i}. {safe_name}\n"
-            text += (
-                f"   └ {data['qty']} un | "
-                f"{format_money(data['commission'])}\n"
+def make_report(title: str, nodes: list[dict], start: datetime, end: datetime) -> str:
+    summary = summarize_conversions(nodes)
+    lines = [
+        f"📊 <b>{html.escape(title)}</b>",
+        f"📅 <code>{start:%d/%m/%Y}</code> → <code>{end:%d/%m/%Y}</code>",
+        "",
+        f"🛒 Pedidos únicos: <b>{summary['orders']}</b>",
+        f"💰 Comissão líquida reportada: <b>{money(summary['commission'])}</b>",
+        "",
+        "<b>Status dos pedidos:</b>",
+    ]
+    for status, count in summary["statuses"].items():
+        lines.append(f"• {status}: {count}")
+    lines.append("")
+    lines.append("<b>Top produtos por comissão de item:</b>")
+    if summary["top"]:
+        for idx, item in enumerate(summary["top"], 1):
+            lines.append(
+                f"{idx}. {html.escape(item['name'][:65])} — "
+                f"{item['qty']} un. — {money(item['commission'])}"
             )
     else:
-        text += "Nenhum pedido registrado neste período.\n"
+        lines.append("Nenhum item encontrado.")
+    lines.extend(["", "⚠️ Conversion Report contém valores estimados; validação final deve ser conferida no painel/Validated Report."])
+    return "\n".join(lines)
+    return sorted(selected, key=lambda p: p["_score"], reverse=True)async def send_report(update: Update, title: str, start: datetime, end: datetime):
+    msg = await update.effective_message.reply_text("Consultando relatório da Shopee...")
+    try:
+        nodes, _ = await asyncio.to_thread(
+            get_conversions, int(start.timestamp()), int(end.timestamp())
+        )
+        report = make_report(title, nodes, start, end)
+        await msg.edit_text(report, parse_mode=ParseMode.HTML)
+    except Exception as exc:
+        logger.exception("Erro no relatório.")
+        await msg.edit_text(f"Não foi possível concluir o relatório: {html.escape(str(exc)[:900])}")
 
-    text += "\n——————————————\n"
-    text += (
-        "⚠️ Os dados da Shopee podem demorar "
-        "algumas horas ou até 1 dia para atualizar."
-    )
-    return text
+
+async def ontem(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update):
+        return
+    day = now_br().date() - timedelta(days=1)
+    start = datetime.combine(day, dt_time.min, BR_TZ)
+    end = datetime.combine(day, dt_time(23, 59, 59), BR_TZ)
+    await send_report(update, "Relatório de ontem", start, end)
 
 
-# =====================================================
-# 11. COMANDOS DO TELEGRAM
-# =====================================================
+async def mes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update):
+        return
+    today = now_br().date()
+    if today.day == 1:
+        await update.effective_message.reply_text("Ainda não há dias anteriores neste mês.")
+        return
+    start = datetime.combine(today.replace(day=1), dt_time.min, BR_TZ)
+    end = datetime.combine(today - timedelta(days=1), dt_time(23, 59, 59), BR_TZ)
+    await send_report(update, "Relatório do mês até ontem", start, end)
+
+
+async def periodo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update):
+        return
+    if len(context.args) != 2:
+        await update.effective_message.reply_text("Uso: /periodo DD/MM/AAAA DD/MM/AAAA")
+        return
+    try:
+        start_date = datetime.strptime(context.args[0], "%d/%m/%Y").date()
+        end_date = datetime.strptime(context.args[1], "%d/%m/%Y").date()
+        if end_date < start_date or end_date > now_br().date():
+            raise ValueError
+        if (end_date - start_date).days > 90:
+            await update.effective_message.reply_text("Por segurança, consulte períodos de até 90 dias.")
+            return
+        start = datetime.combine(start_date, dt_time.min, BR_TZ)
+        end = datetime.combine(end_date, dt_time(23, 59, 59), BR_TZ)
+    except ValueError:
+        await update.effective_message.reply_text("Datas inválidas. Exemplo: /periodo 01/11/2026 22/11/2026")
+        return
+    await send_report(update, "Relatório personalizado", start, end)
+
+
+async def daily_report(context: ContextTypes.DEFAULT_TYPE):
+    yesterday = now_br().date() - timedelta(days=1)
+    start = datetime.combine(yesterday, dt_time.min, BR_TZ)
+    end = datetime.combine(yesterday, dt_time(23, 59, 59), BR_TZ)
+    try:
+        nodes, _ = await asyncio.to_thread(
+            get_conversions, int(start.timestamp()), int(end.timestamp())
+        )
+        report = make_report("Relatório automático — ontem", nodes, start, end)
+        await context.bot.send_message(
+            chat_id=CHAT_ID, text=report, parse_mode=ParseMode.HTML
+        )
+    except Exception:
+        logger.exception("Falha no relatório automático.")
+
+
+# ---------------------------------------------------------------------
+# Comandos auxiliares
+# ---------------------------------------------------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await verificar_acesso(update):
+    if not await guard(update):
         return
-
-    await update.message.reply_text(
-        "Olá! Bem-vindo ao LootZone Analytics V3.\n\n"
-        "📊 RELATÓRIOS\n"
-        "/ontem — Resultado de ontem\n"
-        "/mes — Resultado do mês (com paginação completa)\n"
-        "/periodo 01/11 22/11 — Período personalizado\n\n"
-        "🔎 GARIMPO\n"
-        "/garimpo — Garimpo inteligente V3 (anti-repetição + alerta de variação)\n"
-        "/limpar — Limpa o histórico de produtos já enviados\n\n"
-        "⚙️ SISTEMA\n"
-        "/status — Status do bot\n"
-        "/ajuda — Lista de comandos"
+    await update.effective_message.reply_text(
+        "🤖 <b>LootZone Affiliate Bot</b>\n\n"
+        "<b>Relatórios</b>\n"
+        "/ontem — relatório de ontem\n"
+        "/mes — mês até ontem\n"
+        "/periodo DD/MM/AAAA DD/MM/AAAA — período personalizado\n\n"
+        "<b>Garimpo</b>\n"
+        "/garimpo — buscar oportunidades\n"
+        "/limpar — limpar histórico anti-repetição\n\n"
+        "<b>Sistema</b>\n"
+        "/status — estado do bot\n"
+        "/ajuda — ajuda",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -437,617 +860,63 @@ async def ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def limpar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await verificar_acesso(update):
+    if not await guard(update):
         return
-    clear_seen_items()
-    await update.message.reply_text(
-        "🧹 Histórico de produtos enviados limpo! "
-        "O próximo /garimpo vai considerar todos os anúncios novamente."
-    )
+    await clear_seen()
+    await update.effective_message.reply_text("Histórico anti-repetição limpo.")
 
-
-# =====================================================
-# 12. COMANDO ONTEM
-# =====================================================
-
-async def ontem(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await verificar_acesso(update):
-        return
-
-    await update.message.reply_text("🔎 Buscando dados de ontem...")
-
-    yesterday = datetime.now(BR_TZ) - timedelta(days=1)
-    start_dt = yesterday.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_dt = yesterday.replace(hour=23, minute=59, second=59, microsecond=0)
-    start_ts, end_ts = get_period_start_end(start_dt, end_dt)
-
-    nodes, err = await asyncio.to_thread(get_conversions, start_ts, end_ts)
-
-    if err:
-        await update.message.reply_text(f"❌ Erro na API:\n{err[:2500]}")
-        return
-
-    report = make_report(
-        "Relatório de Ontem",
-        nodes,
-        start_dt.strftime("%d/%m/%Y"),
-        end_dt.strftime("%d/%m/%Y"),
-    )
-    await update.message.reply_text(report, parse_mode="HTML")
-
-
-# =====================================================
-# 13. COMANDO MÊS
-# =====================================================
-
-async def mes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await verificar_acesso(update):
-        return
-
-    await update.message.reply_text("🔎 Buscando dados do mês...")
-
-    now = datetime.now(BR_TZ)
-    if now.day == 1:
-        await update.message.reply_text(
-            "Ainda não existem dias anteriores neste mês para consultar."
-        )
-        return
-
-    start_dt = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    end_dt = (now - timedelta(days=1)).replace(
-        hour=23, minute=59, second=59, microsecond=0
-    )
-    start_ts, end_ts = get_period_start_end(start_dt, end_dt)
-
-    nodes, err = await asyncio.to_thread(
-        get_conversions, start_ts, end_ts, 100
-    )
-
-    if err:
-        await update.message.reply_text(f"❌ Erro na API:\n{err[:2500]}")
-        return
-
-    report = make_report(
-        "Relatório do Mês (até ontem)",
-        nodes,
-        start_dt.strftime("%d/%m/%Y"),
-        end_dt.strftime("%d/%m/%Y"),
-    )
-    await update.message.reply_text(report, parse_mode="HTML")
-
-
-# =====================================================
-# 14. COMANDO PERÍODO
-# =====================================================
-
-async def periodo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await verificar_acesso(update):
-        return
-
-    if len(context.args) != 2:
-        await update.message.reply_text("Use:\n/periodo 01/11 22/11")
-        return
-
-    try:
-        now = datetime.now(BR_TZ)
-        start_raw = datetime.strptime(context.args[0], "%d/%m")
-        end_raw = datetime.strptime(context.args[1], "%d/%m")
-
-        start_year = now.year
-        end_year = now.year
-        if start_raw.month > end_raw.month:
-            end_year += 1
-
-        start_dt = start_raw.replace(
-            year=start_year, hour=0, minute=0, second=0
-        ).replace(tzinfo=BR_TZ)
-        end_dt = end_raw.replace(
-            year=end_year, hour=23, minute=59, second=59
-        ).replace(tzinfo=BR_TZ)
-
-        if end_dt < start_dt or end_dt > now:
-            raise ValueError("Período inválido.")
-
-    except ValueError:
-        await update.message.reply_text(
-            "Data inválida.\nExemplo: /periodo 01/11 22/11"
-        )
-        return
-
-    await update.message.reply_text("🔎 Buscando período solicitado...")
-
-    start_ts, end_ts = get_period_start_end(start_dt, end_dt)
-    nodes, err = await asyncio.to_thread(
-        get_conversions, start_ts, end_ts, 100
-    )
-
-    if err:
-        await update.message.reply_text(f"❌ Erro na API:\n{err[:2500]}")
-        return
-
-    report = make_report(
-        "Relatório Personalizado",
-        nodes,
-        start_dt.strftime("%d/%m/%Y"),
-        end_dt.strftime("%d/%m/%Y"),
-    )
-    await update.message.reply_text(report, parse_mode="HTML")
-
-
-# =====================================================
-# 15. GARIMPO V3 — CONSULTA DE PRODUTOS
-# =====================================================
-
-def fetch_products(keyword, sort_type):
-    safe_keyword = json.dumps(keyword, ensure_ascii=False)
-
-    query = f"""
-    {{
-      productOfferV2(
-        keyword: {safe_keyword},
-        listType: 0,
-        sortType: {sort_type},
-        page: 1,
-        limit: {GARIMPO_CONFIG["limit"]}
-      ) {{
-        nodes {{
-          itemId
-          productName
-          commission
-          commissionRate
-          sellerCommissionRate
-          shopeeCommissionRate
-          priceMin
-          priceMax
-          sales
-          ratingStar
-          shopName
-          shopId
-          offerLink
-          imageUrl
-        }}
-      }}
-    }}
-    """
-
-    data = shopee_request(query)
-    result = data.get("data", {}).get("productOfferV2", {})
-    return result.get("nodes", [])
-
-
-# =====================================================
-# 16. GARIMPO V3 — FILTROS & ANÁLISE DE VARIAÇÃO
-# =====================================================
-
-def estimate_commission(product):
-    api_commission = to_decimal(product.get("commission"))
-    if api_commission > 0:
-        return api_commission
-    price = to_decimal(product.get("priceMin"))
-    rate = to_decimal(product.get("commissionRate"))
-    return price * rate
-
-
-def analyze_variation_risk(price_min, price_max):
-    if price_min <= 0 or price_max <= price_min:
-        return "single", "✅ Variação única (baixo risco)"
-    ratio = price_max / price_min
-    if ratio <= Decimal("1.05"):
-        return "single", "✅ Variação única (baixo risco)"
-    if ratio <= Decimal("1.40"):
-        return "moderate", "🟡 Variações próximas (conferir capa)"
-    return "high", "⚠️ Múltiplas variações (checar capa!)"
-
-
-def filter_product(product):
-    rate = to_decimal(product.get("commissionRate"))
-    price_min = to_decimal(product.get("priceMin"))
-    sales = int(product.get("sales") or 0)
-    rating = to_decimal(product.get("ratingStar"))
-    commission_val = estimate_commission(product)
-
-    if rate < GARIMPO_CONFIG["min_commission_rate"]:
-        return False
-    if commission_val < GARIMPO_CONFIG["min_commission_value"]:
-        return False
-    if price_min < GARIMPO_CONFIG["min_price"]:
-        return False
-    if price_min > GARIMPO_CONFIG["max_price"]:
-        return False
-    if sales < GARIMPO_CONFIG["min_sales"]:
-        return False
-    if rating > 0 and rating < GARIMPO_CONFIG["min_rating"]:
-        return False
-
-    return True
-
-
-# =====================================================
-# 17. GARIMPO V3 — DEDUPLICAÇÃO
-# =====================================================
-
-def collect_unique_products(raw_results, seen_items):
-    unique = {}
-
-    for result in raw_results:
-        product = result["product"]
-        category = result["category"]
-        item_id = str(product.get("itemId") or "")
-
-        if not item_id or item_id in seen_items:
-            continue
-
-        if not filter_product(product):
-            continue
-
-        price_min = to_decimal(product.get("priceMin"))
-        price_max = to_decimal(product.get("priceMax"))
-        var_level, var_label = analyze_variation_risk(price_min, price_max)
-
-        product["price_value"] = float(price_min)
-        product["price_max_value"] = float(price_max)
-        product["variation_level"] = var_level
-        product["variation_label"] = var_label
-        product["sales_value"] = int(product.get("sales") or 0)
-        product["rate_value"] = float(to_decimal(product.get("commissionRate")))
-        product["seller_rate_value"] = float(
-            to_decimal(product.get("sellerCommissionRate"))
-        )
-        product["commission_value"] = float(estimate_commission(product))
-        product["rating_value"] = float(to_decimal(product.get("ratingStar")))
-
-        if item_id not in unique:
-            product["_category"] = category
-            unique[item_id] = product
-        else:
-            existing = unique[item_id]
-            if product["commission_value"] > existing["commission_value"]:
-                product["_category"] = category
-                unique[item_id] = product
-
-    return list(unique.values())
-
-
-# =====================================================
-# 18. GARIMPO V3 — PONTUAÇÃO
-# =====================================================
-
-def calculate_scores(products):
-    if not products:
-        return []
-
-    max_sales = max(p["sales_value"] for p in products)
-    max_commission = max(p["commission_value"] for p in products)
-
-    for product in products:
-        sales = product["sales_value"]
-        commission = product["commission_value"]
-        rating = product["rating_value"]
-
-        demand_score = (
-            math.log1p(sales) / math.log1p(max_sales) * 100
-            if max_sales > 0
-            else 0
-        )
-        commission_score = (
-            math.log1p(commission) / math.log1p(max_commission) * 100
-            if max_commission > 0
-            else 0
-        )
-        rating_score = (min(rating, 5) / 5) * 100 if rating > 0 else 50
-
-        score = (
-            demand_score * 0.35
-            + commission_score * 0.40
-            + rating_score * 0.25
-        )
-
-        # Bônus LOOTZONE: variação única e comissão extra do vendedor
-        if product["variation_level"] == "single":
-            score += 4.0
-        if product["seller_rate_value"] > 0:
-            score += 3.0
-
-        product["score"] = round(min(score, 100.0), 1)
-
-    return sorted(
-        products,
-        key=lambda p: (p["score"], p["commission_value"]),
-        reverse=True,
-    )
-
-
-# =====================================================
-# 19. GARIMPO V3 — DISTRIBUIÇÃO DE RESULTADOS
-# =====================================================
-
-def select_diverse_products(products):
-    selected = []
-    selected_ids = set()
-    category_counts = {}
-
-    for category, config in GARIMPO_CATEGORIES.items():
-        quota = config["quota"]
-        category_products = [p for p in products if p["_category"] == category]
-
-        for product in category_products:
-            if len(selected) >= GARIMPO_CONFIG["max_results"]:
-                break
-            item_id = str(product["itemId"])
-            if item_id in selected_ids:
-                continue
-            selected.append(product)
-            selected_ids.add(item_id)
-            category_counts[category] = category_counts.get(category, 0) + 1
-            if category_counts[category] >= quota:
-                break
-
-    for product in products:
-        if len(selected) >= GARIMPO_CONFIG["max_results"]:
-            break
-        item_id = str(product["itemId"])
-        if item_id in selected_ids:
-            continue
-        category = product["_category"]
-        if category_counts.get(category, 0) >= GARIMPO_CONFIG["fallback_category_limit"]:
-            continue
-        selected.append(product)
-        selected_ids.add(item_id)
-        category_counts[category] = category_counts.get(category, 0) + 1
-
-    return selected
-
-
-# =====================================================
-# 20. GARIMPO V3 — EXECUÇÃO COMPLETA
-# =====================================================
-
-def execute_garimpo():
-    seen_items = load_seen_items()
-    raw_results = []
-    total_searches = 0
-    errors = []
-
-    logger.info("Iniciando Garimpo Inteligente V3 (LOOTZONE).")
-
-    for category, config in GARIMPO_CATEGORIES.items():
-        for keyword in config["keywords"]:
-            for sort_type in GARIMPO_SORT_TYPES:
-                total_searches += 1
-                try:
-                    products = fetch_products(keyword, sort_type)
-                    for product in products:
-                        raw_results.append({
-                            "product": product,
-                            "category": category,
-                        })
-                except Exception as e:
-                    logger.exception("Erro na pesquisa %s", keyword)
-                    errors.append(f"{keyword}: {str(e)[:120]}")
-                time.sleep(GARIMPO_CONFIG["request_delay"])
-
-    unique_products = collect_unique_products(raw_results, seen_items)
-    ranked_products = calculate_scores(unique_products)
-    selected = select_diverse_products(ranked_products)
-
-    # Salva os itens selecionados para não repetir por 7 dias
-    now_ts = time.time()
-    for p in selected:
-        seen_items[str(p["itemId"])] = now_ts
-    save_seen_items(seen_items)
-
-    return {
-        "products": selected,
-        "total_raw": len(raw_results),
-        "total_unique": len(unique_products),
-        "total_searches": total_searches,
-        "errors": errors,
-        "category_counts": {
-            cat: sum(1 for p in selected if p["_category"] == cat)
-            for cat in GARIMPO_CATEGORIES
-        },
-    }
-
-
-# =====================================================
-# 21. GARIMPO V3 — ENVIO AO TELEGRAM
-# =====================================================
-
-async def garimpo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await verificar_acesso(update):
-        return
-
-    status_message = await update.message.reply_text(
-        "🔎 LOOTZONE GARIMPO V3\n\n"
-        "Pesquisando produtos novos (R$ 60 a R$ 220 | Comissão ≥ R$ 12)...\n"
-        "Aguarde."
-    )
-
-    try:
-        result = await asyncio.to_thread(execute_garimpo)
-    except Exception as e:
-        logger.exception("Erro geral no garimpo.")
-        await status_message.edit_text(
-            f"❌ Falha ao executar o garimpo.\n{str(e)[:1000]}"
-        )
-        return
-
-    products = result["products"]
-    if not products:
-        await status_message.edit_text(
-            "Nenhum produto inédito passou pelos filtros.\n\n"
-            f"Pesquisas: {result['total_searches']}\n"
-            f"Resultados brutos: {result['total_raw']}\n"
-            f"Aprovados inéditos: {result['total_unique']}\n\n"
-            "Dica: use /limpar se quiser rever produtos dos últimos 7 dias."
-        )
-        return
-
-    summary = (
-        "✅ GARIMPO LOOTZONE V3 CONCLUÍDO\n\n"
-        f"🔎 Pesquisas: {result['total_searches']}\n"
-        f"📦 Brutos: {result['total_raw']} | Inéditos aprovados: {result['total_unique']}\n"
-        f"🏆 Selecionados: {len(products)}\n\n"
-        "DISTRIBUIÇÃO:\n"
-    )
-    for category, count in result["category_counts"].items():
-        if count > 0:
-            summary += f"• {category}: {count}\n"
-
-    if result["errors"]:
-        summary += "\n⚠️ Algumas pesquisas falharam."
-
-    await status_message.edit_text(summary)
-
-    for index, product in enumerate(products, 1):
-        name = (product.get("productName") or "Produto sem nome")[:65]
-        category = product["_category"]
-        shop = (product.get("shopName") or "Não informada")[:35]
-        link = product.get("offerLink") or ""
-        image = product.get("imageUrl")
-
-        price_min = product["price_value"]
-        price_max = product["price_max_value"]
-        price_str = (
-            f"{format_money(price_min)} a {format_money(price_max)}"
-            if price_max > price_min
-            else format_money(price_min)
-        )
-
-        rate = product["rate_value"] * 100
-        seller_rate = product["seller_rate_value"] * 100
-        commission = product["commission_value"]
-        sales = product["sales_value"]
-        rating = product["rating_value"]
-        score = product["score"]
-        var_label = product["variation_label"]
-
-        extra_tag = f" (Extra loja: {seller_rate:.1f}%)" if seller_rate > 0 else ""
-        rating_str = f"{rating:.2f}/5" if rating > 0 else "Não informada"
-
-        caption = (
-            f"#{index} — {name}\n\n"
-            f"🏷️ Categoria: {category}\n"
-            f"🏆 Pontuação: {score}/100\n"
-            f"{var_label}\n\n"
-            f"💰 Comissão: {rate:.2f}%{extra_tag}\n"
-            f"💵 Ganho est.: {format_money(commission)}\n"
-            f"🏷️ Preço: {price_str}\n"
-            f"📦 Vendas: {sales} | ⭐ {rating_str}\n"
-            f"🏪 Loja: {shop}"
-        )
-
-        if image:
-            try:
-                await context.bot.send_photo(
-                    chat_id=CHAT_ID,
-                    photo=image,
-                    caption=caption[:1000],
-                )
-            except Exception:
-                await context.bot.send_message(
-                    chat_id=CHAT_ID,
-                    text=caption[:4000],
-                )
-        else:
-            await context.bot.send_message(
-                chat_id=CHAT_ID,
-                text=caption[:4000],
-            )
-
-        if link:
-            await context.bot.send_message(
-                chat_id=CHAT_ID,
-                text=f"🔗 Link de afiliado:\n{link}",
-            )
-
-        await asyncio.sleep(0.8)
-
-
-# =====================================================
-# 22. STATUS DO BOT
-# =====================================================
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await verificar_acesso(update):
+    if not await guard(update):
         return
-
-    seen_count = len(load_seen_items())
-    await update.message.reply_text(
-        "🟢 LOOTZONE ANALYTICS V3\n\n"
-        "Bot: Online | API: Configurada | Fuso: Brasília\n"
-        f"Histórico anti-repetição: {seen_count} itens ({SEEN_TTL_DAYS} dias)\n\n"
-        "FILTROS ATIVOS:\n"
-        f"• Comissão: ≥ {GARIMPO_CONFIG['min_commission_rate'] * 100:.0f}% "
-        f"e ≥ {format_money(GARIMPO_CONFIG['min_commission_value'])}\n"
-        f"• Preço: {format_money(GARIMPO_CONFIG['min_price'])} a "
-        f"{format_money(GARIMPO_CONFIG['max_price'])}\n"
-        f"• Vendas: ≥ {GARIMPO_CONFIG['min_sales']} | "
-        f"Nota: ≥ {GARIMPO_CONFIG['min_rating']}"
+    seen = await load_seen()
+    volume_hint = "presumido persistente" if str(SEEN_FILE).startswith("/data/") else "caminho local; confirme persistência no Railway"
+    await update.effective_message.reply_text(
+        "🟢 LootZone Bot operacional\n"
+        f"Fuso: {BR_TZ}\n"
+        f"Produtos no histórico: {len(seen)}\n"
+        f"Arquivo: {SEEN_FILE}\n"
+        f"Armazenamento: {volume_hint}\n"
+        f"Páginas por consulta: {MAX_PRODUCT_PAGES}\n"
+        f"Categorias: {len(GARIMPO_CATEGORIES)}"
     )
 
 
-# =====================================================
-# 23. RELATÓRIO AUTOMÁTICO DIÁRIO
-# =====================================================
+# ---------------------------------------------------------------------
+# Inicialização
+# ---------------------------------------------------------------------
 
-async def daily_report(context: ContextTypes.DEFAULT_TYPE):
-    yesterday = datetime.now(BR_TZ) - timedelta(days=1)
-    start_dt = yesterday.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_dt = yesterday.replace(hour=23, minute=59, second=59, microsecond=0)
-    start_ts, end_ts = get_period_start_end(start_dt, end_dt)
-
-    nodes, err = await asyncio.to_thread(get_conversions, start_ts, end_ts)
-
-    if err:
-        report = f"⚠️ Erro no relatório automático:\n{html.escape(err[:1000])}"
-    else:
-        report = make_report(
-            "Relatório Automático — Ontem",
-            nodes,
-            start_dt.strftime("%d/%m/%Y"),
-            end_dt.strftime("%d/%m/%Y"),
+async def post_init(application: Application):
+    if application.job_queue:
+        application.job_queue.run_daily(
+            daily_report,
+            time=dt_time(hour=REPORT_HOUR, minute=0, tzinfo=BR_TZ),
+            name="lootzone_daily_report",
         )
-
-    await context.bot.send_message(
-        chat_id=CHAT_ID,
-        text=report,
-        parse_mode="HTML",
-    )
-
-
-# =====================================================
-# 24. TRATAMENTO DE ERROS E INICIALIZAÇÃO
-# =====================================================
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error("Erro não tratado:", exc_info=context.error)
+        logger.info("Relatório diário agendado para %02d:00 (Brasília).", REPORT_HOUR)
+    else:
+        logger.warning("JobQueue indisponível; relatório diário não foi agendado.")
 
 
 def main():
-    logger.info("Inicializando LootZone Analytics V3...")
-
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("ajuda", ajuda))
-    app.add_handler(CommandHandler("ontem", ontem))
-    app.add_handler(CommandHandler("mes", mes))
-    app.add_handler(CommandHandler("periodo", periodo))
-    app.add_handler(CommandHandler("garimpo", garimpo))
-    app.add_handler(CommandHandler("limpar", limpar))
-    app.add_handler(CommandHandler("status", status))
-
-    app.add_error_handler(error_handler)
-
-    app.job_queue.run_daily(
-        daily_report,
-        time=dt_time(hour=10, minute=0, tzinfo=BR_TZ),
-        name="relatorio_diario",
+    application = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(post_init)
+        .build()
     )
 
-    logger.info("Bot V3 iniciado. Relatório diário às 10h de Brasília.")
-    app.run_polling()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("ajuda", ajuda))
+    application.add_handler(CommandHandler("ontem", ontem))
+    application.add_handler(CommandHandler("mes", mes))
+    application.add_handler(CommandHandler("periodo", periodo))
+    application.add_handler(CommandHandler("garimpo", garimpo))
+    application.add_handler(CommandHandler("limpar", limpar))
+    application.add_handler(CommandHandler("status", status))
+
+    logger.info("LootZone Affiliate Bot iniciado.")
+    application.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
