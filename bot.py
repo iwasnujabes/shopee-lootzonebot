@@ -3,17 +3,19 @@ import os
 import json
 import time
 import html
-import math
 import hashlib
 import asyncio
 import logging
 import tempfile
+import math
+
 from pathlib import Path
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
 
 import requests
+
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.error import TelegramError, RetryAfter
@@ -22,6 +24,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
 )
+
 
 # ============================================================
 # CONFIGURAÇÕES
@@ -32,7 +35,9 @@ CHAT_ID_RAW = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 SHOPEE_APP_ID = os.getenv("SHOPEE_APP_ID", "").strip()
 SHOPEE_SECRET = os.getenv("SHOPEE_SECRET", "").strip()
 
-SHOPEE_URL = "https://open-api.affiliate.shopee.com.br/graphql"
+SHOPEE_URL = (
+    "https://open-api.affiliate.shopee.com.br/graphql"
+)
 
 FUSO = ZoneInfo("America/Sao_Paulo")
 
@@ -40,45 +45,47 @@ SEEN_FILE = Path(
     os.getenv("SEEN_FILE", "/data/seen_items.json")
 )
 
-HISTORICO_DIAS = 7
-MAX_PAGINAS_GARIMPO = max(
-    1, min(int(os.getenv("GARIMPO_MAX_PAGES", "2")), 5)
-)
-INTERVALO_REQUISICOES = 0.4
 HORARIO_RELATORIO = 10
+HISTORICO_DIAS = 7
 
+# Garimpo otimizado
 LIMITE_PRODUTOS = 30
 MAX_RESULTADOS = 15
 MIN_VENDAS = 50
 MIN_AVALIACAO = Decimal("4.6")
-MIN_TAXA_COMISSAO = Decimal("0.08")
+
+INTERVALO_BUSCAS = 0.35
+TIMEOUT_CONEXAO = 8
+TIMEOUT_RESPOSTA = 20
+TENTATIVAS_SHOPEE = 2
+
+# Uma ordenação principal por vendas.
+# Evita duplicar todas as consultas com várias ordenações.
+ORDENACAO_PRINCIPAL = 2
 
 CATEGORIAS = {
     "Casa e decoração": {
         "quota": 4,
-        "keywords": [
+        "palavras": [
             "quadros decorativos",
             "bandeja decorativa",
-            "espelho decorativo",
         ],
         "min": Decimal("25"),
         "max": Decimal("250"),
     },
     "Móveis e organização": {
         "quota": 3,
-        "keywords": [
+        "palavras": [
             "caixa organizadora",
             "mesa redonda",
-            "organizador de casa",
         ],
         "min": Decimal("50"),
         "max": Decimal("500"),
     },
     "Cozinha e utilidades": {
         "quota": 2,
-        "keywords": [
+        "palavras": [
             "pote hermetico",
-            "lixeira automatica",
             "fruteira cozinha",
         ],
         "min": Decimal("20"),
@@ -86,53 +93,59 @@ CATEGORIAS = {
     },
     "Iluminação": {
         "quota": 1,
-        "keywords": ["luminaria", "abajur"],
+        "palavras": [
+            "luminaria",
+            "abajur",
+        ],
         "min": Decimal("25"),
         "max": Decimal("250"),
     },
     "Geek e colecionáveis": {
         "quota": 2,
-        "keywords": [
+        "palavras": [
             "pelucia pokemon",
             "funko pop",
-            "colecionavel geek",
         ],
         "min": Decimal("25"),
         "max": Decimal("350"),
     },
     "Tecnologia e gadgets": {
         "quota": 1,
-        "keywords": [
+        "palavras": [
             "suporte celular",
             "fone bluetooth",
-            "acessorios tecnologia",
         ],
         "min": Decimal("25"),
         "max": Decimal("350"),
     },
     "Moda e vestuário": {
         "quota": 2,
-        "keywords": [
+        "palavras": [
             "camiseta streetwear",
             "moletom oversized",
-            "roupa y2k",
         ],
         "min": Decimal("30"),
         "max": Decimal("250"),
     },
 }
 
-SORT_TYPES = (2, 5)
 
 # ============================================================
-# INICIALIZAÇÃO E UTILITÁRIOS
+# INICIALIZAÇÃO
 # ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
+
 logger = logging.getLogger("lootzone")
+
+HTTP = requests.Session()
+
+LOCK_GARIMPO = asyncio.Lock()
+LOCK_HISTORICO = asyncio.Lock()
+
 
 def validar_ambiente():
     variaveis = {
@@ -149,7 +162,7 @@ def validar_ambiente():
 
     if faltando:
         raise RuntimeError(
-            "Configure no Railway: " + ", ".join(faltando)
+            "Variáveis ausentes: " + ", ".join(faltando)
         )
 
     try:
@@ -159,11 +172,8 @@ def validar_ambiente():
             "TELEGRAM_CHAT_ID precisa ser numérico."
         ) from exc
 
-CHAT_ID = validar_ambiente()
 
-HTTP = requests.Session()
-LOCK_GARIMPO = asyncio.Lock()
-LOCK_HISTORICO = asyncio.Lock()
+CHAT_ID = validar_ambiente()
 
 
 def agora():
@@ -206,11 +216,12 @@ async def verificar_acesso(update):
                 "Acesso não autorizado."
             )
         return False
+
     return True
 
 
 # ============================================================
-# HISTÓRICO DE PRODUTOS
+# HISTÓRICO PERSISTENTE
 # ============================================================
 
 def carregar_historico_sync():
@@ -231,7 +242,7 @@ def carregar_historico_sync():
         }
 
     except Exception:
-        logger.exception("Erro ao ler histórico.")
+        logger.exception("Erro ao carregar histórico.")
         return {}
 
 
@@ -293,10 +304,10 @@ async def limpar_historico():
 
 
 # ============================================================
-# COMUNICAÇÃO COM SHOPEE
+# SHOPEE — REQUISIÇÃO E BUSCA
 # ============================================================
 
-def requisicao_shopee(query, tentativas=4):
+def requisicao_shopee(query):
     payload = json.dumps(
         {"query": query},
         separators=(",", ":"),
@@ -325,13 +336,16 @@ def requisicao_shopee(query, tentativas=4):
 
     ultimo_erro = None
 
-    for tentativa in range(tentativas):
+    for tentativa in range(TENTATIVAS_SHOPEE):
         try:
             resposta = HTTP.post(
                 SHOPEE_URL,
                 data=payload.encode("utf-8"),
                 headers=headers,
-                timeout=(10, 35),
+                timeout=(
+                    TIMEOUT_CONEXAO,
+                    TIMEOUT_RESPOSTA,
+                ),
             )
 
             if (
@@ -341,21 +355,32 @@ def requisicao_shopee(query, tentativas=4):
                 ultimo_erro = RuntimeError(
                     f"HTTP {resposta.status_code}"
                 )
-                time.sleep(min(2 ** tentativa, 12))
-                continue
+
+                if tentativa < TENTATIVAS_SHOPEE - 1:
+                    time.sleep(2 ** tentativa)
+                    continue
+
+                break
 
             resposta.raise_for_status()
             dados = resposta.json()
 
             erros = dados.get("errors") or []
 
-            if erros and not dados.get("data"):
+            if erros:
+                mensagem = json.dumps(
+                    erros,
+                    ensure_ascii=False,
+                )
+
+                # System Error não é repetido várias vezes.
+                if "System Error" in mensagem:
+                    raise RuntimeError(
+                        "A Shopee retornou um erro interno."
+                    )
+
                 raise RuntimeError(
-                    "Erro GraphQL: "
-                    + json.dumps(
-                        erros,
-                        ensure_ascii=False,
-                    )[:1000]
+                    "Erro GraphQL: " + mensagem[:700]
                 )
 
             return dados
@@ -365,80 +390,64 @@ def requisicao_shopee(query, tentativas=4):
             ValueError,
             RuntimeError,
         ) as erro:
+
             ultimo_erro = erro
 
-            if tentativa < tentativas - 1:
-                time.sleep(min(2 ** tentativa, 12))
+            if tentativa < TENTATIVAS_SHOPEE - 1:
+                time.sleep(2 ** tentativa)
 
     raise RuntimeError(
-        f"Falha na Shopee: {ultimo_erro}"
+        f"Consulta não concluída: {ultimo_erro}"
     )
 
 
-def buscar_produtos(palavra, ordenacao):
+def buscar_produtos(palavra):
     palavra_json = json.dumps(
         palavra,
         ensure_ascii=False,
     )
 
-    pagina = 1
-    produtos = []
-
-    for _ in range(MAX_PAGINAS_GARIMPO):
-        query = f"""
-        {{
-          productOfferV2(
-            keyword: {palavra_json},
-            listType: 0,
-            sortType: {ordenacao},
-            page: {pagina},
-            limit: {LIMITE_PRODUTOS}
-          ) {{
-            nodes {{
-              itemId
-              productName
-              commission
-              commissionRate
-              sellerCommissionRate
-              shopeeCommissionRate
-              priceMin
-              priceMax
-              sales
-              ratingStar
-              shopName
-              shopId
-              offerLink
-              imageUrl
-            }}
-            pageInfo {{
-              hasNextPage
-            }}
-          }}
+    query = f"""
+    {{
+      productOfferV2(
+        keyword: {palavra_json},
+        listType: 0,
+        sortType: {ORDENACAO_PRINCIPAL},
+        page: 1,
+        limit: {LIMITE_PRODUTOS}
+      ) {{
+        nodes {{
+          itemId
+          productName
+          commission
+          commissionRate
+          sellerCommissionRate
+          shopeeCommissionRate
+          priceMin
+          priceMax
+          sales
+          ratingStar
+          shopName
+          shopId
+          offerLink
+          imageUrl
         }}
-        """
+      }}
+    }}
+    """
 
-        resposta = requisicao_shopee(query)
+    resposta = requisicao_shopee(query)
 
-        resultado = (
-            resposta.get("data", {})
-            .get("productOfferV2", {})
-        ) or {}
+    resultado = (
+        resposta.get("data", {})
+        .get("productOfferV2", {})
+    ) or {}
 
-        produtos.extend(resultado.get("nodes") or [])
-
-        page_info = resultado.get("pageInfo") or {}
-
-        if not page_info.get("hasNextPage"):
-            break
-
-        pagina += 1
-        time.sleep(INTERVALO_REQUISICOES)
-
-    return produtos
+    return resultado.get("nodes") or []
 
 
 # ============================================================
-# GARIMPO E PONTUAÇÃO
+# ANÁLISE DOS PRODUTOS
 # ============================================================
 
 def comissao_estimada(produto):
@@ -454,7 +463,7 @@ def comissao_estimada(produto):
 
 
 def produto_elegivel(produto, categoria):
-    configuracao = CATEGORIAS[categoria]
+    config = CATEGORIAS[categoria]
 
     preco = decimal(produto.get("priceMin"))
     vendas = inteiro(produto.get("sales"))
@@ -464,11 +473,7 @@ def produto_elegivel(produto, categoria):
     if preco <= 0:
         return False
 
-    if not (
-        configuracao["min"]
-        <= preco
-        <= configuracao["max"]
-    ):
+    if not config["min"] <= preco <= config["max"]:
         return False
 
     if vendas < MIN_VENDAS:
@@ -477,10 +482,10 @@ def produto_elegivel(produto, categoria):
     if avaliacao > 0 and avaliacao < MIN_AVALIACAO:
         return False
 
-    # Comissão mínima flexível: evita descartar produtos
-    # comprovadamente interessantes por volume de vendas.
+    # Filtro flexível para não eliminar produtos
+    # com boa comissão absoluta e histórico de vendas.
     if (
-        taxa < MIN_TAXA_COMISSAO
+        taxa < Decimal("0.08")
         and comissao_estimada(produto) < Decimal("5")
     ):
         return False
@@ -488,7 +493,7 @@ def produto_elegivel(produto, categoria):
     return True
 
 
-def pontuacao_produtos(produtos):
+def pontuar_produtos(produtos):
     maior_venda = max(
         [inteiro(p.get("sales")) for p in produtos] or [1]
     )
@@ -499,8 +504,6 @@ def pontuacao_produtos(produtos):
             for p in produtos
         ] or [1]
     )
-
-    resultado = []
 
     termos_visuais = (
         "quadro", "espelho", "luminaria", "abajur",
@@ -517,16 +520,16 @@ def pontuacao_produtos(produtos):
         demanda = (
             math.log1p(vendas)
             / math.log1p(max(maior_venda, 1))
-        ) * 30
+        ) * 35
 
         rentabilidade = (
             math.log1p(comissao)
             / math.log1p(max(maior_comissao, 1))
-        ) * 30
+        ) * 35
 
         qualidade = (
-            float(min(avaliacao, Decimal("5"))) / 5 * 10
-            if avaliacao > 0 else 5
+            float(min(avaliacao, Decimal("5"))) / 5 * 15
+            if avaliacao > 0 else 7.5
         )
 
         texto = (
@@ -536,86 +539,99 @@ def pontuacao_produtos(produtos):
         ).lower()
 
         conteudo = (
-            9 if any(t in texto for t in termos_visuais)
-            else 6.5
+            15
+            if any(t in texto for t in termos_visuais)
+            else 10
         )
 
-        # Não há dados diretos de saturação de afiliados
-        # na consulta productOfferV2.
-        concorrencia = 10
-
-        total = min(
-            100,
-            demanda
-            + rentabilidade
-            + qualidade
-            + conteudo
-            + concorrencia,
+        produto["_pontuacao"] = round(
+            demanda + rentabilidade + qualidade + conteudo,
+            1,
         )
 
-        produto["_pontuacao"] = round(total, 1)
         produto["_comissao"] = comissao
         produto["_preco"] = decimal(produto.get("priceMin"))
         produto["_vendas"] = vendas
         produto["_avaliacao"] = avaliacao
 
-        resultado.append(produto)
-
     return sorted(
-        resultado,
+        produtos,
         key=lambda p: p["_pontuacao"],
         reverse=True,
     )
 
 
-def coletar_candidatos(historico):
+# ============================================================
+# GARIMPO OTIMIZADO
+# ============================================================
+
+def coletar_candidatos(historico, progresso=None):
     encontrados = {}
     erros = []
+    total_buscas = sum(
+        len(c["palavras"])
+        for c in CATEGORIAS.values()
+    )
 
-    for categoria, configuracao in CATEGORIAS.items():
-        for palavra in configuracao["keywords"]:
-            for ordenacao in SORT_TYPES:
-                try:
-                    produtos = buscar_produtos(
-                        palavra,
-                        ordenacao,
+    busca_atual = 0
+
+    for categoria, config in CATEGORIAS.items():
+        for palavra in config["palavras"]:
+
+            busca_atual += 1
+
+            try:
+                produtos = buscar_produtos(palavra)
+
+                for produto in produtos:
+                    item_id = str(
+                        produto.get("itemId") or ""
                     )
 
-                    for produto in produtos:
-                        item_id = str(
-                            produto.get("itemId") or ""
-                        )
+                    if not item_id or item_id in historico:
+                        continue
 
-                        if not item_id or item_id in historico:
-                            continue
-
-                        if not produto_elegivel(
-                            produto,
-                            categoria,
-                        ):
-                            continue
-
-                        produto["_categoria"] = categoria
-                        produto["_palavra"] = palavra
-
-                        anterior = encontrados.get(item_id)
-
-                        if (
-                            anterior is None
-                            or comissao_estimada(produto)
-                            > comissao_estimada(anterior)
-                        ):
-                            encontrados[item_id] = produto
-
-                except Exception as erro:
-                    logger.exception(
-                        "Erro na busca %s / %s",
+                    if not produto_elegivel(
+                        produto,
                         categoria,
-                        palavra,
-                    )
-                    erros.append(str(erro)[:150])
+                    ):
+                        continue
 
-                time.sleep(INTERVALO_REQUISICOES)
+                    produto["_categoria"] = categoria
+                    produto["_palavra"] = palavra
+
+                    anterior = encontrados.get(item_id)
+
+                    if (
+                        anterior is None
+                        or comissao_estimada(produto)
+                        > comissao_estimada(anterior)
+                    ):
+                        encontrados[item_id] = produto
+
+            except Exception as erro:
+                logger.warning(
+                    "Busca ignorada: %s / %s | %s",
+                    categoria,
+                    palavra,
+                    erro,
+                )
+
+                erros.append({
+                    "categoria": categoria,
+                    "palavra": palavra,
+                    "erro": str(erro)[:150],
+                })
+
+            if progresso:
+                progresso(
+                    busca_atual,
+                    total_buscas,
+                    categoria,
+                    len(encontrados),
+                )
+
+            time.sleep(INTERVALO_BUSCAS)
 
     return list(encontrados.values()), erros
 
@@ -623,11 +639,14 @@ def coletar_candidatos(historico):
 def selecionar_produtos(produtos):
     selecionados = []
     ids = set()
+
     contagem = {
-        categoria: 0 for categoria in CATEGORIAS
+        categoria: 0
+        for categoria in CATEGORIAS
     }
 
-    for categoria, configuracao in CATEGORIAS.items():
+    # Primeira etapa: cumprir as quotas.
+    for categoria, config in CATEGORIAS.items():
         candidatos = [
             p for p in produtos
             if p["_categoria"] == categoria
@@ -636,7 +655,7 @@ def selecionar_produtos(produtos):
         for produto in candidatos:
             item_id = str(produto.get("itemId"))
 
-            if contagem[categoria] >= configuracao["quota"]:
+            if contagem[categoria] >= config["quota"]:
                 break
 
             if item_id not in ids:
@@ -644,6 +663,7 @@ def selecionar_produtos(produtos):
                 ids.add(item_id)
                 contagem[categoria] += 1
 
+    # Segunda etapa: preencher vagas restantes.
     for produto in produtos:
         if len(selecionados) >= MAX_RESULTADOS:
             break
@@ -681,33 +701,38 @@ def formatar_produto(produto, numero):
 
     link = str(produto.get("offerLink") or "").strip()
 
-    if link.startswith("https://") or link.startswith("http://"):
+    if link.startswith(("https://", "http://")):
         link_texto = (
             f'<a href="{html.escape(link, quote=True)}">'
-            "Ver produto na Shopee</a>"
+            "🛒 Ver produto na Shopee</a>"
         )
     else:
-        link_texto = "Link indisponível"
+        link_texto = "🔗 Link indisponível"
 
-    taxa = decimal(produto.get("commissionRate")) * 100
     avaliacao = produto["_avaliacao"]
 
     avaliacao_texto = (
         f"{avaliacao:.1f}/5"
-        if avaliacao > 0 else "Não informada"
+        if avaliacao > 0
+        else "Não informada"
+    )
+
+    taxa = (
+        decimal(produto.get("commissionRate")) * 100
     )
 
     return (
-        f"<b>{numero}. {nome}</b>\n"
-        f"Categoria: {categoria}\n"
-        f"Preço anunciado: <b>{dinheiro(produto['_preco'])}</b>\n"
-        f"Comissão estimada: <b>{dinheiro(produto['_comissao'])}</b>\n"
-        f"Taxa informada: {taxa:.1f}%\n"
-        f"Vendas informadas: {produto['_vendas']:,}\n"
-        f"Avaliação: {avaliacao_texto}\n"
-        f"Loja: {loja}\n"
-        f"Potencial interno: {produto['_pontuacao']}/100\n"
-        f"Concorrência entre afiliados: não disponível\n"
+        f"🏷️ <b>#{numero} — {nome}</b>\n\n"
+        f"📂 {categoria}\n"
+        f"💵 Preço: <b>{dinheiro(produto['_preco'])}</b>\n"
+        f"💰 Comissão estimada: "
+        f"<b>{dinheiro(produto['_comissao'])}</b>\n"
+        f"📈 Taxa informada: {taxa:.1f}%\n"
+        f"🛍️ Vendas informadas: {produto['_vendas']:,}\n"
+        f"⭐ Avaliação: {avaliacao_texto}\n"
+        f"🏪 Loja: {loja}\n"
+        f"🎯 Pontuação interna: {produto['_pontuacao']}/100\n"
+        f"👥 Concorrência entre afiliados: não disponível\n\n"
         f"{link_texto}"
     )
 
@@ -745,13 +770,48 @@ async def enviar_produto(bot, produto, numero):
                 disable_web_page_preview=True,
             )
             return True
+
         except TelegramError:
-            logger.exception("Erro ao reenviar produto.")
+            logger.exception("Falha no reenvio do produto.")
             return False
 
     except TelegramError:
-        logger.exception("Erro ao enviar produto.")
+        logger.exception("Falha no envio do produto.")
         return False
+
+
+async def atualizar_progresso(
+    mensagem,
+    atual,
+    total,
+    categoria,
+    encontrados,
+):
+    porcentagem = int(atual / max(total, 1) * 100)
+
+    barras_preenchidas = int(porcentagem / 10)
+
+    barra = (
+        "🟩" * barras_preenchidas
+        + "⬜" * (10 - barras_preenchidas)
+    )
+
+    texto = (
+        "🔎 <b>Garimpo da LootZone</b>\n\n"
+        f"{barra} {porcentagem}%\n\n"
+        f"📂 Categoria: {html.escape(categoria)}\n"
+        f"🔍 Buscas concluídas: {atual}/{total}\n"
+        f"📦 Produtos encontrados: {encontrados}\n\n"
+        "Estou analisando as oportunidades..."
+    )
+
+    try:
+        await mensagem.edit_text(
+            texto,
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError:
+        pass
 
 
 async def garimpo(update, context):
@@ -760,33 +820,58 @@ async def garimpo(update, context):
 
     if LOCK_GARIMPO.locked():
         await update.effective_message.reply_text(
-            "Já existe uma busca de produtos em andamento."
+            "⏳ Já existe um garimpo em andamento."
         )
         return
 
     async with LOCK_GARIMPO:
         mensagem = await update.effective_message.reply_text(
-            "🔎 <b>Garimpo iniciado!</b>\n\n"
-            "Estou procurando produtos nas categorias da LootZone.\n"
-            "Isso pode levar alguns minutos.",
+            "🚀 <b>Garimpo iniciado!</b>\n\n"
+            "Estou procurando oportunidades para a LootZone.",
             parse_mode=ParseMode.HTML,
         )
 
         historico = await carregar_historico()
 
+        loop = asyncio.get_running_loop()
+
+        def progresso(atual, total, categoria, encontrados):
+            asyncio.run_coroutine_threadsafe(
+                atualizar_progresso(
+                    mensagem,
+                    atual,
+                    total,
+                    categoria,
+                    encontrados,
+                ),
+                loop,
+            )
+
         candidatos, erros = await asyncio.to_thread(
             coletar_candidatos,
             historico,
+            progresso,
         )
 
         if not candidatos:
+            texto = (
+                "🔎 <b>Garimpo finalizado</b>\n\n"
+                "Não encontrei produtos que passaram pelos filtros.\n\n"
+                "Tente novamente mais tarde."
+            )
+
+            if erros:
+                texto += (
+                    f"\n⚠️ Consultas com erro: {len(erros)}"
+                )
+
             await mensagem.edit_text(
-                "Não encontrei produtos que passaram pelos filtros "
-                "nesta busca.\n\nTente novamente mais tarde."
+                texto,
+                parse_mode=ParseMode.HTML,
             )
             return
 
-        classificados = pontuacao_produtos(candidatos)
+        classificados = pontuar_produtos(candidatos)
         selecionados = selecionar_produtos(classificados)
 
         enviados = []
@@ -803,25 +888,21 @@ async def garimpo(update, context):
                 quantidade += 1
                 enviados.append(str(produto["itemId"]))
 
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.4)
 
         if enviados:
             await marcar_como_visto(enviados)
 
         resumo = (
-            "✅ <b>Busca concluída!</b>\n\n"
-            f"Produtos encontrados: {len(candidatos)}\n"
-            f"Produtos selecionados: {len(selecionados)}\n"
-            f"Enviados para você: {quantidade}\n\n"
-            "Os produtos enviados ficam no histórico por "
-            f"{HISTORICO_DIAS} dias."
+            "✅ <b>Garimpo concluído!</b>\n\n"
+            f"🔍 Produtos encontrados: <b>{len(candidatos)}</b>\n"
+            f"🏆 Produtos selecionados: <b>{len(selecionados)}</b>\n"
+            f"📨 Produtos enviados: <b>{quantidade}</b>\n"
+            f"⚠️ Consultas com erro: <b>{len(erros)}</b>\n\n"
+            f"🗂️ Histórico de repetição: {HISTORICO_DIAS} dias\n\n"
+            "💡 A pontuação é uma classificação interna. "
+            "A API não informa quantos afiliados divulgam cada produto."
         )
-
-        if erros:
-            resumo += (
-                f"\n\nAlgumas consultas apresentaram erros: "
-                f"{len(erros)}."
-            )
 
         await mensagem.edit_text(
             resumo,
@@ -838,7 +919,7 @@ STATUS_PT = {
     "PENDING": "Aguardando confirmação",
     "COMPLETED": "Concluídos",
     "CANCELLED": "Cancelados",
-    "UNKNOWN": "Não identificado",
+    "UNKNOWN": "Não identificados",
 }
 
 
@@ -846,7 +927,7 @@ def buscar_conversoes(inicio, fim, limite=100, max_paginas=10):
     registros = []
     scroll_id = None
 
-    for pagina in range(max_paginas):
+    for _ in range(max_paginas):
         scroll = (
             f", scrollId: {json.dumps(scroll_id)}"
             if scroll_id else ""
@@ -908,8 +989,7 @@ def buscar_conversoes(inicio, fim, limite=100, max_paginas=10):
             )
 
     raise RuntimeError(
-        "O relatório ultrapassou o limite de páginas. "
-        "Não vou apresentar um resultado incompleto como total."
+        "O relatório ultrapassou o limite de páginas."
     )
 
 
@@ -1010,9 +1090,9 @@ def montar_relatorio(titulo, registros, inicio, fim):
         "━━━━━━━━━━━━━━━━━━",
         "💰 <b>RESULTADO</b>",
         "",
-        f"Pedidos registrados: <b>{resumo['pedidos']}</b>",
+        f"🛒 Pedidos registrados: <b>{resumo['pedidos']}</b>",
         (
-            "Comissão informada pela Shopee: "
+            "💵 Comissão informada pela Shopee: "
             f"<b>{dinheiro(resumo['comissao'])}</b>"
         ),
         "",
@@ -1039,8 +1119,8 @@ def montar_relatorio(titulo, registros, inicio, fim):
 
             linhas.append(
                 f"<b>{numero}. {nome}</b>\n"
-                f"   {item['quantidade']} unidade(s) "
-                f"• {dinheiro(item['comissao'])}"
+                f"   📦 {item['quantidade']} un. "
+                f"• 💰 {dinheiro(item['comissao'])}"
             )
             linhas.append("")
     else:
@@ -1048,14 +1128,12 @@ def montar_relatorio(titulo, registros, inicio, fim):
 
     linhas.extend([
         "━━━━━━━━━━━━━━━━━━",
-        "ℹ️ <i>Os valores de comissão são os informados "
-        "no relatório da Shopee e podem estar sujeitos "
-        "à validação.</i>",
+        "ℹ️ <i>Comissões informadas pela Shopee podem "
+        "estar sujeitas à validação.</i>",
     ])
 
     texto = "\n".join(linhas)
 
-    # Evita ultrapassar o limite de mensagem do Telegram.
     if len(texto) > 3900:
         texto = texto[:3800] + (
             "\n\n<i>Relatório resumido para caber na mensagem.</i>"
@@ -1089,10 +1167,10 @@ async def enviar_relatorio(update, titulo, inicio, fim):
         )
 
     except Exception as erro:
-        logger.exception("Falha ao gerar relatório.")
+        logger.exception("Falha no relatório.")
 
         await mensagem.edit_text(
-            "Não consegui consultar o relatório agora.\n\n"
+            "⚠️ Não consegui consultar o relatório.\n\n"
             + html.escape(str(erro)[:500])
         )
 
@@ -1156,7 +1234,7 @@ async def periodo(update, context):
 
     if len(context.args) != 2:
         await update.effective_message.reply_text(
-            "Use assim:\n"
+            "📅 Use assim:\n"
             "/periodo 01/11/2026 22/11/2026"
         )
         return
@@ -1180,7 +1258,7 @@ async def periodo(update, context):
 
         if (data_fim - data_inicio).days > 90:
             await update.effective_message.reply_text(
-                "O período máximo permitido é de 90 dias."
+                "O período máximo é de 90 dias."
             )
             return
 
@@ -1238,27 +1316,25 @@ async def relatorio_automatico(context):
         )
 
     except Exception:
-        logger.exception(
-            "Erro no relatório automático."
-        )
+        logger.exception("Erro no relatório automático.")
 
         await context.bot.send_message(
             chat_id=CHAT_ID,
             text=(
                 "⚠️ Não consegui gerar o resumo automático "
-                "de ontem. Verifique os logs do bot."
+                "de ontem. Verifique os registros do bot."
             ),
         )
 
 
 # ============================================================
-# MENU E COMANDOS
+# MENU
 # ============================================================
 
 TEXTO_INICIO = (
-    "👋 <b>Olá! Este é o painel da LootZone.</b>\n\n"
-    "Acompanhe seus resultados e encontre novos produtos "
-    "para divulgar.\n\n"
+    "👋 <b>Bem-vindo ao painel da LootZone!</b>\n\n"
+    "Aqui você acompanha seus resultados e encontra "
+    "novas oportunidades para divulgar.\n\n"
     "📊 <b>SEUS RESULTADOS</b>\n"
     "/ontem — resumo de ontem\n"
     "/mes — resumo do mês\n"
@@ -1293,7 +1369,7 @@ async def limpar(update, context):
     await limpar_historico()
 
     await update.effective_message.reply_text(
-        "🧹 Histórico de produtos limpo.\n"
+        "🧹 Histórico de produtos limpo!\n\n"
         "O próximo garimpo poderá encontrar produtos "
         "que já apareceram anteriormente."
     )
@@ -1305,17 +1381,14 @@ async def status(update, context):
 
     historico = await carregar_historico()
 
-    arquivo_ok = SEEN_FILE.exists()
-
     await update.effective_message.reply_text(
         "🟢 <b>LootZone Bot</b>\n\n"
         "Situação: em execução\n"
-        f"Produtos no histórico: {len(historico)}\n"
-        f"Arquivo de histórico: "
-        f"{'Encontrado' if arquivo_ok else 'Ainda não criado'}\n"
-        f"Categorias de busca: {len(CATEGORIAS)}\n"
-        f"Horário do resumo diário: {HORARIO_RELATORIO:02d}:00\n"
-        "Fuso horário: Brasília\n\n"
+        f"📦 Produtos no histórico: {len(historico)}\n"
+        f"🗂️ Arquivo: {SEEN_FILE}\n"
+        f"🔎 Categorias de busca: {len(CATEGORIAS)}\n"
+        f"⏰ Resumo diário: {HORARIO_RELATORIO:02d}:00\n"
+        "🇧🇷 Horário de Brasília\n\n"
         "O histórico depende de um Volume persistente "
         "configurado no Railway.",
         parse_mode=ParseMode.HTML,
@@ -1323,7 +1396,7 @@ async def status(update, context):
 
 
 # ============================================================
-# INICIALIZAÇÃO E AGENDAMENTO
+# INICIALIZAÇÃO
 # ============================================================
 
 async def ao_iniciar(application):
@@ -1345,7 +1418,7 @@ async def ao_iniciar(application):
     else:
         logger.error(
             "JobQueue indisponível. "
-            "O relatório automático não foi agendado."
+            "Relatório automático não agendado."
         )
 
 
