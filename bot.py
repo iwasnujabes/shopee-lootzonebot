@@ -6,7 +6,6 @@ import requests
 from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-import asyncio
 
 # ============ CONFIGURAÇÕES (vêm do Railway) ============
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -99,7 +98,7 @@ def summarize(nodes):
 
 def make_report(title: str, nodes, start_date: str, end_date: str):
     if nodes is None:
-        return f"⚠️ Erro ao buscar dados da Shopee.\nTente novamente em alguns minutos."
+        return "⚠️ Erro ao buscar dados da Shopee.\nTente novamente em alguns minutos."
 
     orders, commission, top = summarize(nodes)
 
@@ -205,9 +204,10 @@ async def periodo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def garimpo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Garimpando produtos com boa comissão... aguarde.")
 
+    # Busca produtos ordenados por comissão (versão mais estável)
     query = """
     {
-      productOfferV2(listType: 1, sortType: 5, page: 1, limit: 8) {
+      productOfferV2(keyword: "kit", listType: 0, sortType: 5, page: 1, limit: 10) {
         nodes {
           productName
           commissionRate
@@ -224,7 +224,27 @@ async def garimpo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     nodes = data.get("data", {}).get("productOfferV2", {}).get("nodes", [])
 
     if not nodes:
-        await update.message.reply_text("Nenhum produto encontrado no momento.")
+        # Tentativa extra com outra palavra-chave
+        query2 = """
+        {
+          productOfferV2(keyword: "pelucia", sortType: 5, page: 1, limit: 10) {
+            nodes {
+              productName
+              commissionRate
+              sellerCommissionRate
+              priceMin
+              sales
+              shopName
+              offerLink
+            }
+          }
+        }
+        """
+        data = shopee_request(query2)
+        nodes = data.get("data", {}).get("productOfferV2", {}).get("nodes", [])
+
+    if not nodes:
+        await update.message.reply_text("Nenhum produto encontrado no momento. Tente novamente mais tarde.")
         return
 
     text = "🔍 *Garimpo - Produtos com boa comissão*\n\n"
@@ -267,9 +287,9 @@ def main():
     app.add_handler(CommandHandler("periodo", periodo))
     app.add_handler(CommandHandler("garimpo", garimpo))
 
-    # Relatório automático todos os dias às 10:00 (horário de Brasília aproximado)
+    # Relatório automático todos os dias às 10:00 (horário de Brasília)
     job_queue = app.job_queue
-    job_queue.run_daily(daily_report, time=datetime.strptime("13:00", "%H:%M").time())  # 10h BRT = 13h UTC
+    job_queue.run_daily(daily_report, time=datetime.strptime("13:00", "%H:%M").time())  # 10h BRT ≈ 13h UTC
 
     print("Bot iniciado...")
     app.run_polling()
