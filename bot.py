@@ -20,7 +20,7 @@ from telegram.ext import (
 )
 
 # =====================================================
-# CONFIGURAÇÕES
+# 1. CONFIGURAÇÕES
 # =====================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -36,31 +36,94 @@ SHOPEE_URL = (
 BR_TZ = ZoneInfo("America/Sao_Paulo")
 
 # =====================================================
-# CONFIGURAÇÃO DO GARIMPO
+# 2. CONFIGURAÇÕES DO GARIMPO V2
 # =====================================================
 
 GARIMPO_CONFIG = {
     "min_commission_rate": Decimal("0.08"),
     "min_sales": 100,
     "min_price": Decimal("50.00"),
+
     "limit": 30,
-    "max_pages": 2,
-    "max_results": 8,
-    "request_delay": 0.3,
+    "max_results": 15,
+
+    "request_delay": 0.25,
+
+    # Máximo de produtos da mesma categoria
+    # durante a redistribuição das vagas.
+    "fallback_category_limit": 5,
 }
 
-GARIMPO_KEYWORDS = [
-    "pelucia",
-    "organizador",
-    "luminaria",
-    "decoracao",
-    "gamer",
-    "cozinha",
-    "cadeira",
-]
+# Categorias, palavras-chave e vagas iniciais.
+# A ordem também determina a prioridade de pesquisa.
+
+GARIMPO_CATEGORIES = {
+    "Casa e decoração": {
+        "quota": 5,
+        "keywords": [
+            "decoracao",
+            "quadros decorativos",
+        ],
+    },
+
+    "Cozinha e utilidades": {
+        "quota": 3,
+        "keywords": [
+            "pote hermetico",
+            "fruteira",
+        ],
+    },
+
+    "Iluminação": {
+        "quota": 2,
+        "keywords": [
+            "luminaria",
+            "abajur",
+        ],
+    },
+
+    "Móveis e organização": {
+        "quota": 2,
+        "keywords": [
+            "aparador",
+            "organizador de casa",
+        ],
+    },
+
+    "Geek e colecionáveis": {
+        "quota": 1,
+        "keywords": [
+            "pelucia pokemon",
+            "funko pop",
+        ],
+    },
+
+    "Tecnologia e gadgets": {
+        "quota": 1,
+        "keywords": [
+            "suporte celular",
+            "fone bluetooth",
+        ],
+    },
+
+    "Moda e vestuário": {
+        "quota": 1,
+        "keywords": [
+            "camiseta oversized",
+            "moletom",
+        ],
+    },
+}
+
+# Ordenações da Shopee:
+# 2 = Mais vendidos
+# 5 = Maior comissão
+
+GARIMPO_SORT_TYPES = [2, 5]
+
 
 # =====================================================
-# LOGS
+# 3. LOGS
 # =====================================================
 
 logging.basicConfig(
@@ -68,11 +131,11 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-logger = logging.getLogger("LootZoneBot")
+logger = logging.getLogger("LootZoneAnalytics")
 
 
 # =====================================================
-# VALIDAÇÃO DE CONFIGURAÇÕES
+# 4. VALIDAÇÃO DAS CONFIGURAÇÕES
 # =====================================================
 
 def validate_config():
@@ -85,8 +148,8 @@ def validate_config():
     }
 
     missing = [
-        name
-        for name, value in required.items()
+        key
+        for key, value in required.items()
         if not value
     ]
 
@@ -98,9 +161,10 @@ def validate_config():
 
     try:
         return int(CHAT_ID_RAW)
+
     except ValueError:
         raise RuntimeError(
-            "TELEGRAM_CHAT_ID precisa ser numérico."
+            "TELEGRAM_CHAT_ID inválido."
         )
 
 
@@ -108,45 +172,26 @@ CHAT_ID = validate_config()
 
 
 # =====================================================
-# SEGURANÇA
-# =====================================================
-
-def autorizado(update: Update):
-
-    if not update.effective_chat:
-        return False
-
-    return update.effective_chat.id == CHAT_ID
-
-
-async def verificar_acesso(update: Update):
-
-    if not autorizado(update):
-        if update.effective_message:
-            await update.effective_message.reply_text(
-                "Acesso não autorizado."
-            )
-
-        return False
-
-    return True
-
-
-# =====================================================
-# FUNÇÕES AUXILIARES
+# 5. FUNÇÕES AUXILIARES
 # =====================================================
 
 def to_decimal(value):
 
     try:
         return Decimal(str(value or "0"))
-    except (InvalidOperation, ValueError, TypeError):
+
+    except (
+        InvalidOperation,
+        ValueError,
+        TypeError,
+    ):
         return Decimal("0")
 
 
 def format_money(value):
 
     try:
+
         number = float(value)
 
         return (
@@ -157,6 +202,7 @@ def format_money(value):
         )
 
     except (ValueError, TypeError):
+
         return "R$ 0,00"
 
 
@@ -164,12 +210,39 @@ def get_period_start_end(start_dt, end_dt):
 
     return (
         int(start_dt.timestamp()),
-        int(end_dt.timestamp())
+        int(end_dt.timestamp()),
     )
 
 
 # =====================================================
-# SHOPEE API
+# 6. SEGURANÇA DO TELEGRAM
+# =====================================================
+
+def autorizado(update: Update):
+
+    return (
+        update.effective_chat is not None
+        and update.effective_chat.id == CHAT_ID
+    )
+
+
+async def verificar_acesso(update: Update):
+
+    if not autorizado(update):
+
+        if update.effective_message:
+
+            await update.effective_message.reply_text(
+                "Acesso não autorizado."
+            )
+
+        return False
+
+    return True
+
+
+# =====================================================
+# 7. CONEXÃO SHOPEE API
 # =====================================================
 
 def shopee_request(query: str):
@@ -197,6 +270,7 @@ def shopee_request(query: str):
             f"Timestamp={timestamp}, "
             f"Signature={signature}"
         ),
+
         "Content-Type": "application/json",
     }
 
@@ -212,6 +286,7 @@ def shopee_request(query: str):
     data = response.json()
 
     if data.get("errors"):
+
         raise RuntimeError(
             f"Erro GraphQL: {data['errors']}"
         )
@@ -220,13 +295,13 @@ def shopee_request(query: str):
 
 
 # =====================================================
-# RELATÓRIOS DE CONVERSÃO
+# 8. RELATÓRIOS DE CONVERSÃO
 # =====================================================
 
 def get_conversions(
     start_ts: int,
     end_ts: int,
-    limit: int = 50
+    limit: int = 50,
 ):
 
     query = f"""
@@ -244,8 +319,10 @@ def get_conversions(
           totalCommission
           netCommission
           sellerCommission
+
           orders {{
             orderId
+
             items {{
               itemId
               itemName
@@ -255,6 +332,7 @@ def get_conversions(
             }}
           }}
         }}
+
         pageInfo {{
           hasNextPage
           scrollId
@@ -277,9 +355,10 @@ def get_conversions(
         page_info = report.get("pageInfo", {})
 
         if page_info.get("hasNextPage"):
+
             logger.warning(
-                "Relatório possui próxima página. "
-                "A paginação ainda precisa ser implementada."
+                "Existem mais páginas no relatório "
+                "de conversões. Paginação pendente."
             )
 
         return nodes, None
@@ -287,19 +366,20 @@ def get_conversions(
     except Exception as e:
 
         logger.exception(
-            "Falha ao buscar conversões."
+            "Erro ao consultar conversões."
         )
 
         return None, str(e)
 
 
 # =====================================================
-# RESUMO DE CONVERSÕES
+# 9. RESUMO DE VENDAS
 # =====================================================
 
 def summarize(nodes):
 
     total_orders = 0
+
     total_commission = 0.0
 
     products = {}
@@ -317,14 +397,17 @@ def summarize(nodes):
             for item in order.get("items", []):
 
                 name = (
-                    item.get("itemName") or "Produto"
+                    item.get("itemName")
+                    or "Produto"
                 )[:50]
 
                 commission = float(
                     item.get("itemTotalCommission") or 0
                 )
 
-                qty = int(item.get("qty") or 1)
+                qty = int(
+                    item.get("qty") or 1
+                )
 
                 if name not in products:
 
@@ -351,7 +434,7 @@ def summarize(nodes):
 
 
 # =====================================================
-# MONTAGEM DE RELATÓRIOS
+# 10. FORMATAÇÃO DOS RELATÓRIOS
 # =====================================================
 
 def make_report(
@@ -414,7 +497,7 @@ def make_report(
 
 
 # =====================================================
-# COMANDO START
+# 11. COMANDOS DO TELEGRAM
 # =====================================================
 
 async def start(
@@ -434,11 +517,11 @@ async def start(
         "/periodo 01/11 22/11 — Período personalizado\n\n"
 
         "🔎 GARIMPO\n"
-        "/garimpo — Garimpo inteligente\n\n"
+        "/garimpo — Garimpo inteligente V2\n\n"
 
         "⚙️ SISTEMA\n"
         "/status — Status do bot\n"
-        "/ajuda — Lista de comandos",
+        "/ajuda — Lista de comandos"
     )
 
 
@@ -451,7 +534,7 @@ async def ajuda(
 
 
 # =====================================================
-# COMANDO ONTEM
+# 12. COMANDO ONTEM
 # =====================================================
 
 async def ontem(
@@ -466,7 +549,10 @@ async def ontem(
         "🔎 Buscando dados de ontem..."
     )
 
-    yesterday = datetime.now(BR_TZ) - timedelta(days=1)
+    yesterday = (
+        datetime.now(BR_TZ)
+        - timedelta(days=1)
+    )
 
     start_dt = yesterday.replace(
         hour=0,
@@ -496,7 +582,7 @@ async def ontem(
     if err:
 
         await update.message.reply_text(
-            f"❌ Erro na API:\n{err[:3000]}"
+            f"❌ Erro na API:\n{err[:2500]}"
         )
 
         return
@@ -515,7 +601,7 @@ async def ontem(
 
 
 # =====================================================
-# COMANDO MÊS
+# 13. COMANDO MÊS
 # =====================================================
 
 async def mes(
@@ -532,6 +618,15 @@ async def mes(
 
     now = datetime.now(BR_TZ)
 
+    if now.day == 1:
+
+        await update.message.reply_text(
+            "Ainda não existem dias anteriores "
+            "neste mês para consultar."
+        )
+
+        return
+
     start_dt = now.replace(
         day=1,
         hour=0,
@@ -546,15 +641,6 @@ async def mes(
         second=59,
         microsecond=0,
     )
-
-    if now.day == 1:
-
-        await update.message.reply_text(
-            "Ainda não há dias anteriores "
-            "neste mês para consultar."
-        )
-
-        return
 
     start_ts, end_ts = get_period_start_end(
         start_dt,
@@ -571,7 +657,7 @@ async def mes(
     if err:
 
         await update.message.reply_text(
-            f"❌ Erro na API:\n{err[:3000]}"
+            f"❌ Erro na API:\n{err[:2500]}"
         )
 
         return
@@ -590,7 +676,7 @@ async def mes(
 
 
 # =====================================================
-# COMANDO PERÍODO PERSONALIZADO
+# 14. COMANDO PERÍODO
 # =====================================================
 
 async def periodo(
@@ -604,8 +690,7 @@ async def periodo(
     if len(context.args) != 2:
 
         await update.message.reply_text(
-            "Use o formato:\n"
-            "/periodo 01/11 22/11"
+            "Use:\n/periodo 01/11 22/11"
         )
 
         return
@@ -614,12 +699,12 @@ async def periodo(
 
         now = datetime.now(BR_TZ)
 
-        start_dt = datetime.strptime(
+        start_raw = datetime.strptime(
             context.args[0],
             "%d/%m",
         )
 
-        end_dt = datetime.strptime(
+        end_raw = datetime.strptime(
             context.args[1],
             "%d/%m",
         )
@@ -627,17 +712,17 @@ async def periodo(
         start_year = now.year
         end_year = now.year
 
-        if start_dt.month > end_dt.month:
+        if start_raw.month > end_raw.month:
             end_year += 1
 
-        start_dt = start_dt.replace(
+        start_dt = start_raw.replace(
             year=start_year,
             hour=0,
             minute=0,
             second=0,
         ).replace(tzinfo=BR_TZ)
 
-        end_dt = end_dt.replace(
+        end_dt = end_raw.replace(
             year=end_year,
             hour=23,
             minute=59,
@@ -645,7 +730,7 @@ async def periodo(
         ).replace(tzinfo=BR_TZ)
 
         if end_dt < start_dt:
-            raise ValueError("Período invertido.")
+            raise ValueError("Período inválido.")
 
         if end_dt > now:
             raise ValueError("Data futura.")
@@ -653,7 +738,7 @@ async def periodo(
     except ValueError:
 
         await update.message.reply_text(
-            "Data inválida ou período incorreto.\n\n"
+            "Data inválida.\n"
             "Exemplo: /periodo 01/11 22/11"
         )
 
@@ -678,7 +763,7 @@ async def periodo(
     if err:
 
         await update.message.reply_text(
-            f"❌ Erro na API:\n{err[:3000]}"
+            f"❌ Erro na API:\n{err[:2500]}"
         )
 
         return
@@ -697,84 +782,67 @@ async def periodo(
 
 
 # =====================================================
-# GARIMPO INTELIGENTE - CONSULTA DE PRODUTOS
+# 15. GARIMPO V2 — CONSULTA DE PRODUTOS
 # =====================================================
 
 def fetch_products(keyword, sort_type):
-
-    all_products = []
 
     safe_keyword = json.dumps(
         keyword,
         ensure_ascii=False,
     )
 
-    for page in range(
-        1,
-        GARIMPO_CONFIG["max_pages"] + 1,
-    ):
+    query = f"""
+    {{
+      productOfferV2(
+        keyword: {safe_keyword},
+        listType: 0,
+        sortType: {sort_type},
+        page: 1,
+        limit: {GARIMPO_CONFIG["limit"]}
+      ) {{
+        nodes {{
+          itemId
+          productName
 
-        query = f"""
-        {{
-          productOfferV2(
-            keyword: {safe_keyword},
-            listType: 0,
-            sortType: {sort_type},
-            page: {page},
-            limit: {GARIMPO_CONFIG["limit"]}
-          ) {{
-            nodes {{
-              itemId
-              productName
-              commissionRate
-              sellerCommissionRate
-              shopeeCommissionRate
-              commission
-              priceMin
-              priceMax
-              priceDiscountRate
-              sales
-              ratingStar
-              shopName
-              shopId
-              shopType
-              offerLink
-              imageUrl
-            }}
-            pageInfo {{
-              page
-              limit
-              hasNextPage
-            }}
-          }}
+          commission
+          commissionRate
+          sellerCommissionRate
+          shopeeCommissionRate
+
+          priceMin
+          priceMax
+          sales
+          ratingStar
+
+          shopName
+          shopId
+
+          offerLink
+          imageUrl
         }}
-        """
 
-        data = shopee_request(query)
+        pageInfo {{
+          page
+          limit
+          hasNextPage
+        }}
+      }}
+    }}
+    """
 
-        result = (
-            data.get("data", {})
-            .get("productOfferV2", {})
-        )
+    data = shopee_request(query)
 
-        nodes = result.get("nodes", [])
+    result = (
+        data.get("data", {})
+        .get("productOfferV2", {})
+    )
 
-        page_info = result.get("pageInfo", {})
-
-        all_products.extend(nodes)
-
-        if not page_info.get("hasNextPage"):
-            break
-
-        time.sleep(
-            GARIMPO_CONFIG["request_delay"]
-        )
-
-    return all_products
+    return result.get("nodes", [])
 
 
 # =====================================================
-# GARIMPO - FILTROS
+# 16. GARIMPO V2 — FILTROS COMERCIAIS
 # =====================================================
 
 def filter_product(product):
@@ -791,22 +859,63 @@ def filter_product(product):
         product.get("sales") or 0
     )
 
+    min_rate = GARIMPO_CONFIG[
+        "min_commission_rate"
+    ]
+
+    min_price = GARIMPO_CONFIG[
+        "min_price"
+    ]
+
+    min_sales = GARIMPO_CONFIG[
+        "min_sales"
+    ]
+
     return (
-        rate >= GARIMPO_CONFIG["min_commission_rate"]
-        and price >= GARIMPO_CONFIG["min_price"]
-        and sales >= GARIMPO_CONFIG["min_sales"]
+        rate >= min_rate
+        and price >= min_price
+        and sales >= min_sales
     )
 
 
 # =====================================================
-# GARIMPO - PREPARAÇÃO DOS PRODUTOS
+# 17. GARIMPO V2 — CÁLCULO DA COMISSÃO
 # =====================================================
 
-def prepare_garimpo(products):
+def estimate_commission(product):
+
+    api_commission = to_decimal(
+        product.get("commission")
+    )
+
+    if api_commission > 0:
+
+        return api_commission
+
+    price = to_decimal(
+        product.get("priceMin")
+    )
+
+    rate = to_decimal(
+        product.get("commissionRate")
+    )
+
+    return price * rate
+
+
+# =====================================================
+# 18. GARIMPO V2 — DEDUPLICAÇÃO
+# =====================================================
+
+def collect_unique_products(raw_results):
 
     unique = {}
 
-    for product in products:
+    for result in raw_results:
+
+        product = result["product"]
+
+        category = result["category"]
 
         item_id = str(
             product.get("itemId") or ""
@@ -818,102 +927,130 @@ def prepare_garimpo(products):
         if not filter_product(product):
             continue
 
-        price = to_decimal(
-            product.get("priceMin")
-        )
-
-        rate = to_decimal(
-            product.get("commissionRate")
-        )
-
-        api_commission = to_decimal(
-            product.get("commission")
-        )
-
-        # Prioriza a comissão informada pela API.
-        # Se não estiver disponível, calcula uma estimativa.
-
-        estimated = (
-            api_commission
-            if api_commission > 0
-            else price * rate
-        )
-
-        product["price_value"] = float(price)
-
-        product["estimated_rate"] = float(rate)
-
-        product["estimated_commission"] = float(
-            estimated
+        product["price_value"] = float(
+            to_decimal(product.get("priceMin"))
         )
 
         product["sales_value"] = int(
             product.get("sales") or 0
         )
 
-        previous = unique.get(item_id)
+        product["rate_value"] = float(
+            to_decimal(product.get("commissionRate"))
+        )
 
-        if previous is None:
+        product["commission_value"] = float(
+            estimate_commission(product)
+        )
+
+        product["rating_value"] = float(
+            to_decimal(product.get("ratingStar"))
+        )
+
+        if item_id not in unique:
+
+            product["_category"] = category
+
+            product["_categories_found"] = [
+                category
+            ]
 
             unique[item_id] = product
 
         else:
 
+            existing = unique[item_id]
+
+            if category not in existing["_categories_found"]:
+
+                existing["_categories_found"].append(
+                    category
+                )
+
+            # Preserva o registro com maior comissão
+            # quando o mesmo produto aparece novamente.
+
             if (
-                product["estimated_commission"]
-                > previous["estimated_commission"]
+                product["commission_value"]
+                > existing["commission_value"]
             ):
+
+                product["_category"] = category
+
+                product["_categories_found"] = (
+                    existing["_categories_found"]
+                )
 
                 unique[item_id] = product
 
-    candidates = list(unique.values())
+    return list(unique.values())
 
-    if not candidates:
+
+# =====================================================
+# 19. GARIMPO V2 — PONTUAÇÃO
+# =====================================================
+
+def calculate_scores(products):
+
+    if not products:
         return []
 
     max_sales = max(
         p["sales_value"]
-        for p in candidates
+        for p in products
     )
 
     max_commission = max(
-        p["estimated_commission"]
-        for p in candidates
+        p["commission_value"]
+        for p in products
     )
 
-    for product in candidates:
+    for product in products:
 
-        sales_score = (
-            math.log1p(product["sales_value"])
+        sales = product["sales_value"]
+
+        commission = product["commission_value"]
+
+        rating = product["rating_value"]
+
+        # DEMANDA: 35%
+
+        demand_score = (
+            math.log1p(sales)
             / math.log1p(max_sales)
             * 100
             if max_sales > 0
             else 0
         )
 
+        # COMISSÃO ABSOLUTA: 40%
+
         commission_score = (
-            product["estimated_commission"]
-            / max_commission
+            math.log1p(commission)
+            / math.log1p(max_commission)
             * 100
             if max_commission > 0
             else 0
         )
 
-        rating = float(
-            to_decimal(
-                product.get("ratingStar")
-            )
-        )
+        # AVALIAÇÃO: 25%
+        # Se não existir avaliação, utiliza 50 pontos
+        # como valor neutro, sem excluir o produto.
 
-        rating_score = min(
-            max(rating, 0),
-            5
-        ) / 5 * 100
+        if rating > 0:
+
+            rating_score = (
+                min(rating, 5) / 5
+            ) * 100
+
+        else:
+
+            rating_score = 50
 
         score = (
-            sales_score * 0.40
+            demand_score * 0.35
             + commission_score * 0.40
-            + rating_score * 0.20
+            + rating_score * 0.25
         )
 
         product["score"] = round(
@@ -922,78 +1059,209 @@ def prepare_garimpo(products):
         )
 
     return sorted(
-        candidates,
+        products,
         key=lambda p: (
             p["score"],
-            p["estimated_commission"],
+            p["commission_value"],
         ),
         reverse=True,
     )
 
 
 # =====================================================
-# GARIMPO - EXECUÇÃO DA PESQUISA
+# 20. GARIMPO V2 — DISTRIBUIÇÃO DE RESULTADOS
+# =====================================================
+
+def select_diverse_products(products):
+
+    selected = []
+
+    selected_ids = set()
+
+    category_counts = {}
+
+    # PRIMEIRA ETAPA:
+    # Preenche as vagas reservadas por categoria.
+
+    for category, config in GARIMPO_CATEGORIES.items():
+
+        quota = config["quota"]
+
+        category_products = [
+            p for p in products
+            if p["_category"] == category
+        ]
+
+        for product in category_products:
+
+            if len(selected) >= GARIMPO_CONFIG["max_results"]:
+                break
+
+            item_id = str(product["itemId"])
+
+            if item_id in selected_ids:
+                continue
+
+            selected.append(product)
+
+            selected_ids.add(item_id)
+
+            category_counts[category] = (
+                category_counts.get(category, 0) + 1
+            )
+
+            if category_counts[category] >= quota:
+                break
+
+    # SEGUNDA ETAPA:
+    # Redistribui vagas não preenchidas.
+    # Limita a concentração de uma categoria.
+
+    for product in products:
+
+        if len(selected) >= GARIMPO_CONFIG["max_results"]:
+            break
+
+        item_id = str(product["itemId"])
+
+        if item_id in selected_ids:
+            continue
+
+        category = product["_category"]
+
+        current_count = category_counts.get(
+            category,
+            0,
+        )
+
+        max_category = GARIMPO_CONFIG[
+            "fallback_category_limit"
+        ]
+
+        if current_count >= max_category:
+            continue
+
+        selected.append(product)
+
+        selected_ids.add(item_id)
+
+        category_counts[category] = (
+            current_count + 1
+        )
+
+    return selected
+
+
+# =====================================================
+# 21. GARIMPO V2 — PESQUISA COMPLETA
 # =====================================================
 
 def execute_garimpo():
 
-    all_products = []
+    raw_results = []
 
     total_searches = 0
 
     errors = []
 
-    for keyword in GARIMPO_KEYWORDS:
+    logger.info(
+        "Iniciando Garimpo Inteligente V2."
+    )
 
-        for sort_type in (2, 5):
+    for category, config in GARIMPO_CATEGORIES.items():
 
-            try:
+        keywords = config["keywords"]
 
-                logger.info(
-                    "Garimpo: %s | ordenação %s",
-                    keyword,
-                    sort_type,
-                )
+        for keyword in keywords:
 
-                products = fetch_products(
-                    keyword,
-                    sort_type,
-                )
-
-                all_products.extend(products)
+            for sort_type in GARIMPO_SORT_TYPES:
 
                 total_searches += 1
 
-            except Exception as e:
+                try:
 
-                logger.exception(
-                    "Falha na pesquisa: %s",
-                    keyword,
+                    logger.info(
+                        "Categoria: %s | "
+                        "Palavra: %s | "
+                        "Ordenação: %s",
+                        category,
+                        keyword,
+                        sort_type,
+                    )
+
+                    products = fetch_products(
+                        keyword,
+                        sort_type,
+                    )
+
+                    for product in products:
+
+                        raw_results.append({
+                            "product": product,
+                            "category": category,
+                        })
+
+                except Exception as e:
+
+                    logger.exception(
+                        "Erro na pesquisa %s",
+                        keyword,
+                    )
+
+                    errors.append(
+                        f"{keyword}: {str(e)[:120]}"
+                    )
+
+                time.sleep(
+                    GARIMPO_CONFIG["request_delay"]
                 )
 
-                errors.append(
-                    f"{keyword}: {str(e)[:150]}"
-                )
+    # REMOVE DUPLICADOS
 
-            time.sleep(
-                GARIMPO_CONFIG["request_delay"]
-            )
+    unique_products = collect_unique_products(
+        raw_results
+    )
 
-    candidates = prepare_garimpo(
-        all_products
+    # CALCULA PONTUAÇÃO
+
+    ranked_products = calculate_scores(
+        unique_products
+    )
+
+    # DISTRIBUI OS RESULTADOS
+
+    selected = select_diverse_products(
+        ranked_products
+    )
+
+    logger.info(
+        "Garimpo finalizado: "
+        "%s pesquisas, %s resultados brutos, "
+        "%s aprovados e %s selecionados.",
+        total_searches,
+        len(raw_results),
+        len(unique_products),
+        len(selected),
     )
 
     return {
-        "products": candidates,
-        "total_raw": len(all_products),
-        "total_approved": len(candidates),
+        "products": selected,
+        "total_raw": len(raw_results),
+        "total_unique": len(unique_products),
         "total_searches": total_searches,
         "errors": errors,
+        "category_counts": {
+            category: sum(
+                1 for p in selected
+                if p["_category"] == category
+            )
+            for category in GARIMPO_CATEGORIES
+        },
     }
 
 
 # =====================================================
-# GARIMPO - ENVIO DOS RESULTADOS
+# 22. GARIMPO V2 — ENVIO AO TELEGRAM
 # =====================================================
 
 async def garimpo(
@@ -1004,10 +1272,12 @@ async def garimpo(
     if not await verificar_acesso(update):
         return
 
-    status = await update.message.reply_text(
-        "🔎 GARIMPO INTELIGENTE LOOTZONE\n\n"
-        "Iniciando pesquisa automática...\n"
-        "Analisando demanda, comissão e avaliações."
+    status_message = await update.message.reply_text(
+        "🔎 LOOTZONE GARIMPO V2\n\n"
+        "Iniciando pesquisa em 7 categorias...\n\n"
+        "Analisando vendas, comissões, preços "
+        "e avaliações.\n\n"
+        "Aguarde."
     )
 
     try:
@@ -1022,72 +1292,83 @@ async def garimpo(
             "Erro geral no garimpo."
         )
 
-        await status.edit_text(
-            "❌ Erro ao executar o garimpo.\n"
+        await status_message.edit_text(
+            "❌ Falha ao executar o garimpo.\n"
             f"{str(e)[:1000]}"
         )
 
         return
 
-    candidates = result["products"]
+    products = result["products"]
 
-    if not candidates:
+    if not products:
 
-        message = (
+        await status_message.edit_text(
             "Nenhum produto passou pelos filtros.\n\n"
-            f"Pesquisas realizadas: "
-            f"{result['total_searches']}\n"
-            f"Produtos analisados: "
-            f"{result['total_raw']}\n\n"
-            "Tente novamente mais tarde."
+            f"Pesquisas: {result['total_searches']}\n"
+            f"Resultados brutos: {result['total_raw']}\n"
+            f"Produtos únicos aprovados: "
+            f"{result['total_unique']}\n\n"
+            "Consulte os logs do Railway "
+            "caso alguma pesquisa tenha falhado."
         )
-
-        if result["errors"]:
-            message += (
-                "\n\nAlgumas pesquisas falharam. "
-                "Consulte os logs do Railway."
-            )
-
-        await status.edit_text(message)
 
         return
 
-    selected = candidates[
-        :GARIMPO_CONFIG["max_results"]
-    ]
+    # RESUMO
 
     summary = (
-        "✅ GARIMPO CONCLUÍDO\n\n"
-        f"Pesquisas realizadas: "
+        "✅ GARIMPO LOOTZONE V2 CONCLUÍDO\n\n"
+
+        f"🔎 Pesquisas realizadas: "
         f"{result['total_searches']}\n"
-        f"Produtos encontrados: "
+
+        f"📦 Resultados brutos: "
         f"{result['total_raw']}\n"
-        f"Aprovados nos filtros: "
-        f"{result['total_approved']}\n"
-        f"Selecionados: {len(selected)}\n\n"
+
+        f"♻️ Produtos únicos aprovados: "
+        f"{result['total_unique']}\n"
+
+        f"🏆 Produtos selecionados: "
+        f"{len(products)}\n\n"
+
         "FILTROS:\n"
         "• Comissão mínima: 8%\n"
         "• Vendas mínimas: 100\n"
-        "• Preço mínimo: R$ 50,00\n\n"
-        "Classificação: demanda, rentabilidade "
-        "e avaliação."
+        "• Preço mínimo: R$ 50\n\n"
+
+        "DISTRIBUIÇÃO:\n"
     )
+
+    for category, count in result[
+        "category_counts"
+    ].items():
+
+        if count > 0:
+
+            summary += (
+                f"• {category}: {count}\n"
+            )
 
     if result["errors"]:
 
         summary += (
-            "\n\n⚠️ Algumas pesquisas falharam. "
-            "O resultado pode estar incompleto."
+            "\n⚠️ Algumas pesquisas falharam. "
+            "Os resultados podem estar incompletos."
         )
 
-    await status.edit_text(summary)
+    await status_message.edit_text(summary)
 
-    for i, product in enumerate(selected, 1):
+    # ENVIA OS PRODUTOS
+
+    for index, product in enumerate(products, 1):
 
         name = (
             product.get("productName")
             or "Produto sem nome"
         )
+
+        category = product["_category"]
 
         shop = (
             product.get("shopName")
@@ -1099,105 +1380,105 @@ async def garimpo(
             or ""
         )
 
-        image = (
-            product.get("imageUrl")
-        )
+        image = product.get("imageUrl")
 
         price = product["price_value"]
 
-        rate = (
-            product["estimated_rate"] * 100
-        )
+        rate = product["rate_value"] * 100
 
-        commission = (
-            product["estimated_commission"]
-        )
+        commission = product["commission_value"]
 
         sales = product["sales_value"]
 
-        rating = to_decimal(
-            product.get("ratingStar")
-        )
-
-        seller_rate = (
-            to_decimal(
-                product.get("sellerCommissionRate")
-            ) * 100
-        )
-
-        shopee_rate = (
-            to_decimal(
-                product.get("shopeeCommissionRate")
-            ) * 100
-        )
+        rating = product["rating_value"]
 
         score = product["score"]
 
-        discount = to_decimal(
-            product.get("priceDiscountRate")
-        )
-
         caption = (
-            f"#{i} | {name[:65]}\n\n"
+            f"#{index} — {name[:65]}\n\n"
+
+            f"🏷️ Categoria: {category}\n"
 
             f"🏆 Pontuação: {score}/100\n\n"
 
-            f"💰 Comissão total: {rate:.2f}%\n"
-            f"   ├ Vendedor: {seller_rate:.2f}%\n"
-            f"   └ Shopee: {shopee_rate:.2f}%\n\n"
+            f"💰 Comissão: {rate:.2f}%\n"
 
             f"💵 Ganho estimado: "
             f"{format_money(commission)}\n"
 
             f"🏷️ Preço: {format_money(price)}\n"
-            f"📦 Vendas informadas: {sales}\n"
-            f"⭐ Avaliação: {rating:.2f}/5\n"
-            f"📉 Desconto informado: {discount:.0f}%\n"
-            f"🏪 Loja: {shop[:40]}\n\n"
 
-            "📊 Concorrência: não mensurada.\n"
-            "A API não informa quantidade de afiliados."
+            f"📦 Vendas informadas: {sales}\n"
+
+            f"⭐ Avaliação: "
+            f"{rating:.2f}/5"
+            if rating > 0
+            else
+            f"#{index} — {name[:65]}\n\n"
+            f"🏷️ Categoria: {category}\n"
+            f"🏆 Pontuação: {score}/100\n\n"
+            f"💰 Comissão: {rate:.2f}%\n"
+            f"💵 Ganho estimado: {format_money(commission)}\n"
+            f"🏷️ Preço: {format_money(price)}\n"
+            f"📦 Vendas informadas: {sales}\n"
+            "⭐ Avaliação: Não informada"
         )
 
-        if link:
-            caption += (
-                f"\n\n🔗 Link de afiliado:\n{link}"
-            )
+        caption += (
+            f"\n🏪 Loja: {shop[:35]}"
+        )
 
-        try:
+        caption += (
+            "\n\n⚠️ Concorrência entre afiliados "
+            "não disponibilizada pela API."
+        )
 
-            if image:
+        # Envia foto sem ultrapassar o limite
+        # de legenda do Telegram.
+
+        if image:
+
+            try:
 
                 await context.bot.send_photo(
-                    chat_id=update.effective_chat.id,
+                    chat_id=CHAT_ID,
                     photo=image,
-                    caption=caption[:1024],
+                    caption=caption[:1000],
                 )
 
-            else:
+            except Exception:
+
+                logger.exception(
+                    "Falha ao enviar imagem do produto."
+                )
 
                 await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
+                    chat_id=CHAT_ID,
                     text=caption[:4000],
                 )
 
-        except Exception:
-
-            logger.exception(
-                "Falha ao enviar produto %s",
-                product.get("itemId"),
-            )
+        else:
 
             await context.bot.send_message(
-                chat_id=update.effective_chat.id,
+                chat_id=CHAT_ID,
                 text=caption[:4000],
             )
 
-        await asyncio.sleep(0.9)
+        # Link separado para não exceder
+        # o limite da legenda.
+
+        if link:
+
+            await context.bot.send_message(
+                chat_id=CHAT_ID,
+                text=f"🔗 Link de afiliado:\n{link}",
+            )
+
+        await asyncio.sleep(0.8)
 
 
 # =====================================================
-# STATUS DO BOT
+# 23. STATUS DO BOT
 # =====================================================
 
 async def status(
@@ -1209,23 +1490,32 @@ async def status(
         return
 
     await update.message.reply_text(
-        "🟢 LOOTZONE ANALYTICS\n\n"
+        "🟢 LOOTZONE ANALYTICS V2\n\n"
+
         "Bot: Online\n"
         "API: Configurada\n"
-        "Fuso: America/Sao_Paulo\n\n"
+        "Fuso: Brasília\n\n"
+
         "GARIMPO:\n"
-        f"Comissão mínima: "
+        "Categorias: 7\n"
+        "Pesquisas por execução: 28\n"
+        "Produtos por consulta: 30\n"
+        "Resultados desejados: 15\n\n"
+
+        "FILTROS:\n"
+        f"Comissão: "
         f"{GARIMPO_CONFIG['min_commission_rate'] * 100}%\n"
-        f"Vendas mínimas: "
+
+        f"Vendas: "
         f"{GARIMPO_CONFIG['min_sales']}\n"
-        f"Preço mínimo: "
-        f"{format_money(GARIMPO_CONFIG['min_price'])}\n\n"
-        "Para testar a API, execute /garimpo."
+
+        f"Preço: "
+        f"{format_money(GARIMPO_CONFIG['min_price'])}\n"
     )
 
 
 # =====================================================
-# RELATÓRIO AUTOMÁTICO DIÁRIO
+# 24. RELATÓRIO AUTOMÁTICO DIÁRIO
 # =====================================================
 
 async def daily_report(
@@ -1264,15 +1554,15 @@ async def daily_report(
 
     if err:
 
-        text = (
+        report = (
             "⚠️ Não foi possível gerar "
             "o relatório automático.\n\n"
-            f"Erro: {err[:1000]}"
+            f"{err[:1000]}"
         )
 
     else:
 
-        text = make_report(
+        report = make_report(
             "Relatório Automático — Ontem",
             nodes,
             start_dt.strftime("%d/%m/%Y"),
@@ -1281,13 +1571,13 @@ async def daily_report(
 
     await context.bot.send_message(
         chat_id=CHAT_ID,
-        text=text,
+        text=report,
         parse_mode="Markdown",
     )
 
 
 # =====================================================
-# TRATAMENTO GLOBAL DE ERROS
+# 25. TRATAMENTO DE ERROS
 # =====================================================
 
 async def error_handler(
@@ -1302,13 +1592,13 @@ async def error_handler(
 
 
 # =====================================================
-# MAIN
+# 26. INICIALIZAÇÃO
 # =====================================================
 
 def main():
 
     logger.info(
-        "Iniciando LootZone Analytics..."
+        "Inicializando LootZone Analytics V2..."
     )
 
     app = (
@@ -1353,7 +1643,7 @@ def main():
         error_handler
     )
 
-    # RELATÓRIO DIÁRIO ÀS 10H DE BRASÍLIA
+    # RELATÓRIO AUTOMÁTICO ÀS 10H
 
     app.job_queue.run_daily(
         daily_report,
@@ -1366,7 +1656,8 @@ def main():
     )
 
     logger.info(
-        "Bot iniciado. Agendamento: 10h Brasília."
+        "Bot iniciado com sucesso. "
+        "Relatório diário às 10h de Brasília."
     )
 
     app.run_polling()
